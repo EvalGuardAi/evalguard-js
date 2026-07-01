@@ -1,0 +1,22 @@
+{
+  "name": "@evalguard/sdk",
+  "version": "2.4.0",
+  "description": "Official EvalGuard SDK — LLM evaluation, red-team security, runtime guardrails, observability, and FinOps. Note: a third-party package named `evalguard` exists on npm and is not affiliated with EvalGuard, Inc.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.js", "default": "./dist/index.js" },
+    "./vitest": { "types": "./dist/vitest.d.ts", "import": "./dist/vitest.js", "require": "./dist/vitest.js", "default": "./dist/vitest.js" }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": { "build": "tsc", "type-check": "tsc --noEmit", "test": "vitest run" },
+  "keywords": ["llm","evaluation","ai","security","agents","evalguard","red-team","prompt-injection","guardrails","ai-safety","llm-security","agent-evaluation","monitoring"],
+  "license": "Apache-2.0",
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "https://github.com/EvalGuardAi/evalguard-js.git" },
+  "homepage": "https://evalguard.ai",
+  "bugs": { "url": "https://github.com/EvalGuardAi/evalguard-js/issues" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org/" },
+  "dependencies": { "@evalguard/core": "^1.4.0", "zod": "^4.4.3", "yaml": "^2.9.0" },
+  "devDependencies": { "@types/node": "^26.0.0", "typescript": "^6.0.3", "vitest": "^4.1.9" }
+}
