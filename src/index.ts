@@ -1,7 +1,29 @@
 export { EvalGuard, EvalGuardError, SDK_VERSION } from "./client";
+// Fail-closed response validation. Every verdict-returning method raises
+// `EvalGuardError { code: INDETERMINATE_VERDICT_CODE }` when the 2xx body
+// carries no usable verdict — it is never resolved as "allowed". Callers that
+// want to distinguish "the control could not run" from a genuine API error
+// match on this code. See the "Indeterminate verdicts" block in client.ts.
+export { INDETERMINATE_VERDICT_CODE, GUARDRAIL_ACTIONS } from "./client";
+// The MCP gateway's 2xx decision vocabulary (mcpInvoke), and the code
+// assertVersionAllowed() throws when the org's client-version policy could not
+// be READ — distinguishable from a genuine pin violation.
+export { MCP_INVOKE_DECISIONS, VERSION_POLICY_INDETERMINATE_CODE } from "./client";
 export type { EvalGuardConfig, VersionPolicyResult, IntentClassification, ShadowAiDetection, ShadowAiDetectionsResult } from "./client";
 // Data-boundary façade (G11) wire types (core DataBoundaryPolicy/Decision come via `export type * from "@evalguard/core"`).
 export type { DataBoundaryPolicyRecord, DataBoundaryEvalDecision } from "./client";
+// Agent memory-governance policy (Wave 3) wire type (core MemoryGovernanceMode/
+// MemoryGovernanceConfig come via `export type * from "@evalguard/core"`).
+export type { MemoryGovernancePolicyRecord } from "./client";
+// Gateway guardrail-config (Wave 2) CRUD types + the local-vendor value array /
+// guard so callers can model the local-vs-vendor secretRef rule (core
+// GuardrailFlagAction comes via `export type * from "@evalguard/core"`).
+export type {
+  GuardrailConfigRecord,
+  UpsertGuardrailConfigParams,
+  LocalGuardrailVendor,
+} from "./client";
+export { LOCAL_GUARDRAIL_VENDORS, isLocalGuardrailVendor } from "./client";
 
 // Eval types
 export type {
@@ -9,13 +31,17 @@ export type {
   EvalRun,
   CaseResult,
   EvalResult,
+  EvalStartedRun,
+  EvalRunCaseResult,
+  EvalRunSummary,
+  EvalRunDetail,
   CompareEvalsParams,
   EvalComparison,
   EvalComparisonRun,
   EvalComparisonCase,
 } from "./client";
 
-// Imperative (Weave-style) EvaluationLogger — record predictions/scores against
+// Imperative EvaluationLogger — record predictions/scores against
 // a live run without a full declarative eval() config.
 export { EvaluationLogger } from "./eval-logger";
 export type {
@@ -31,6 +57,7 @@ export type {
   SecurityScanParams,
   Severity,
   SecurityFinding,
+  SecurityScanStartedRun,
   SecurityScanResult,
   ScanSummary,
 } from "./client";
@@ -76,6 +103,7 @@ export type {
   CreateAgentParams,
   CreateAgentResult,
   RunGuardrailsParams,
+  GuardrailsReason,
   GuardrailsCheckResult,
   ChatCompletionMessage,
   ChatCompletionsParams,
@@ -193,6 +221,52 @@ export type {
 
 export type * from "@evalguard/core";
 
+// ── Typed prompt artifacts (Phase 1) ──────────────────────────────────────
+// A prompt version is a first-class TYPED artifact: a `PromptConfig`
+// (model + the standard LLM generation parameters + tools), a
+// structured `PromptTemplate` (completion string or ordered ChatTemplate), and
+// a portable `.prompt` file format. The *types* already reach SDK consumers via
+// `export type *` above; the runtime helpers and enum VALUE arrays need
+// explicit VALUE re-exports so callers can build, validate, render and
+// (de)serialize a prompt's identity from `@evalguard/sdk` without a second
+// import of `@evalguard/core`.
+export {
+  MODEL_ENDPOINT_VALUES,
+  MODEL_PROVIDER_VALUES,
+  TEMPLATE_LANGUAGE_VALUES,
+  OPENAI_REASONING_EFFORT_VALUES,
+  RESPONSE_FORMAT_TYPE_VALUES,
+  CHAT_ROLE_VALUES,
+  validatePromptConfig,
+  isChatTemplate,
+  extractTemplateVariables,
+  validateTemplateInputs,
+  renderStringTemplate,
+  renderChatTemplate,
+  renderPromptTemplate,
+  MissingTemplateInputError,
+  // NOTE: `findUnsupportedTemplateSyntax` / `UnsupportedTemplateSyntaxError`
+  // (strict rendering now refuses jinja `{% … %}` / `{# … #}` instead of
+  // shipping the raw tag to the provider) are reachable via `@evalguard/core`.
+  // They are not re-exported here yet because this package typechecks against
+  // core's built `dist/`, which has to be rebuilt first.
+  serializePromptFile,
+  parsePromptFile,
+  promptFileFrom,
+} from "@evalguard/core";
+
+// ── Named environments + managed Tools (Phase 2) ──────────────────────────
+// Arbitrary named deployment environments (replacing hardcoded staging/prod)
+// and a managed, versioned Tool system with deployment + env-vars. The *types*
+// (Environment, ToolConfig, ToolEnvironmentVariable, …) reach SDK consumers via
+// `export type *` above; the runtime helpers and value arrays need explicit
+// value re-exports.
+export {
+  ENVIRONMENT_TAG_VALUES,
+  SEEDED_ENVIRONMENTS,
+  validateToolConfig,
+} from "@evalguard/core";
+
 // Tracing
 export {
   traceable,
@@ -205,6 +279,34 @@ export {
 } from "./tracing";
 export type { TraceSpan, TraceableOptions, TracingConfig, TraceIdentity } from "./tracing";
 
+// ── Tracing + security decorators (Phase 3) ───────────────────────────────
+// Sugar over the tracing substrate (`traceable`) and the core firewall
+// (`guard`/`guardOutput`): `flow`/`prompt`/`tool` span wrappers
+// (+ `@withFlow`/`@withPrompt`/`@withTool`/`@withTrace` method decorators) and
+// the `@guard`/`withGuard` firewall decorator that gates a call's inputs +
+// outputs in one line.
+export {
+  flow,
+  prompt,
+  tool,
+  guard,
+  GuardBlockedError,
+  EG_FILE_TYPE_ATTR,
+  withFlow,
+  withPrompt,
+  withTool,
+  withTrace,
+  withGuard,
+} from "./decorators";
+export type {
+  SpanFileType,
+  SpanDecoratorOptions,
+  GuardPolicy,
+  GuardPhase,
+  GuardViolationEvent,
+  GuardOptions,
+} from "./decorators";
+
 // Vercel AI SDK auto-wrapper — one-line instrumentation for users of the `ai` package
 export { wrapAISDK, configureVercelAI } from "@evalguard/core";
 export type {
@@ -213,8 +315,8 @@ export type {
   WrapAISDKOptions,
 } from "@evalguard/core";
 
-// Programmatic plugin / strategy / scorer registration — closes the
-// Promptfoo gap (custom redteam plugins / graders defined in user code).
+// Programmatic plugin / strategy / scorer registration — custom redteam
+// plugins / graders defined in user code, without forking the monorepo.
 export {
   definePlugin,
   defineStrategy,
@@ -241,3 +343,19 @@ export {
   expectScore,
 } from "./vitest";
 export type { EvalGuardVitestConfig } from "./vitest";
+
+// Sandbox awareness. Detects a NemoClaw/OpenClaw sandbox and reads its egress
+// policy, so a blocked host is reported as a one-line YAML fix instead of an
+// undifferentiated `fetch failed`. Advisory only — nothing here throws or
+// blocks a call. Held identical to `@evalguard/nemoclaw`'s copy by
+// scripts/duplicated-source-drift-check.mjs.
+export {
+  detectSandbox,
+  isNemoClawEnv,
+  readPolicyFileRaw,
+  readSandboxPolicy,
+  isHostAllowedByPolicy,
+  isEvalGuardAllowed,
+  diagnoseSandboxEgress,
+} from "./sandbox";
+export type { SandboxInfo, NemoClawPolicy, SandboxEgressDiagnosis } from "./sandbox";

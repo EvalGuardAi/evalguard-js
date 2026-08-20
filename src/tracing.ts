@@ -28,6 +28,22 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+// Secret redaction for telemetry egress lives in the published zero-dep leaf
+// `@evalguard/wrapper-core` so `@evalguard/otel-sdk` shares the SAME list
+// instead of forking a third copy. See ./tracing.ts's "Secret redaction"
+// section and packages/wrapper-core/src/secret-redaction.ts.
+import {
+  REDACTED,
+  isSecretKey,
+  looksSecretValue,
+  redactEmbeddedSecrets,
+  followSameHostRedirects,
+} from "@evalguard/wrapper-core";
+// Generated from package.json#version on `prebuild` (scripts/gen-version.mjs).
+// The trace-ingest User-Agent below used to hard-code "evalguard-js/2.0.2",
+// eleven releases behind the 3.1.2 this package actually publishes, so
+// server-side telemetry could not tell which SDK build sent a span.
+import { SDK_VERSION } from "./version";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -101,7 +117,7 @@ function _getConfig(): Required<TracingConfig> {
     // P2-12: align with the rest of the SDK/CLI/Python/Go (host evalguard.ai +
     // /api segment). This base has `/v1/traces/ingest` appended below, so it must
     // NOT include /v1 — yielding the canonical https://evalguard.ai/api/v1/traces/ingest.
-    // The prior default (https://api.evalguard.ai) dropped /api and used a
+    // The prior default (https://api.evalguard.ai) dropped /api and used a (known-dead-host: narrates the default this line replaced)
     // different host, silently dropping spans (the sender swallows all errors).
     baseUrl: _stripTrailingSlashes(_config.baseUrl ?? env.EVALGUARD_BASE_URL ?? "https://evalguard.ai/api"),
     projectId: _config.projectId ?? env.EVALGUARD_PROJECT_ID ?? "",
@@ -213,8 +229,18 @@ class SpanBuilder {
     if (this.parentSpanId) d.parentSpanId = this.parentSpanId;
     if (Object.keys(this.inputs).length > 0) d.inputs = _safeSerialize(this.inputs) as Record<string, unknown>;
     if (this.outputs !== undefined) d.outputs = _safeSerialize(this.outputs);
-    if (this.error) d.error = this.error;
-    if (this.errorStack) d.errorStack = this.errorStack;
+    // A386: these two used to be assigned RAW while everything beside them went
+    // through _safeSerialize. An SDK user's `throw new Error(\`auth failed for
+    // ${apiKey}\`)` — or any provider SDK that echoes the Authorization header
+    // into its exception message — shipped the credential verbatim to a
+    // persisted, dashboard-rendered store, on the DEFAULT traceable() path.
+    //
+    // _safeSerialize alone would NOT have fixed it: _looksSecretValue is
+    // whole-string anchored by design (so ordinary prose is never masked), and
+    // an error message is a SENTENCE CONTAINING a token, never the token
+    // itself. Free text needs the scanning form.
+    if (this.error) d.error = _redactEmbeddedSecrets(this.error);
+    if (this.errorStack) d.errorStack = _redactEmbeddedSecrets(this.errorStack);
     return d;
   }
 }
@@ -232,34 +258,25 @@ class SpanBuilder {
 // Redaction is deep (objects + arrays) and runs inside _safeSerialize's
 // recursion so it covers nested inputs/outputs/metadata.
 
-const _SECRET_KEY_RE = /(api[_-]?key|secret|token|password|passwd|authorization|auth[_-]?token|access[_-]?key|private[_-]?key|client[_-]?secret|bearer|credential|session[_-]?id|cookie)/i;
+// 2026-07-30: the pattern list, the un-anchoring derivation and both scanners
+// USED TO LIVE HERE. `@evalguard/otel-sdk` needs exactly the same knowledge for
+// its 55 `recordException()` egress points, and a second literal copy of a
+// secret list is the failure mode this file's own comments already warn about
+// ("a drifted secret list fails silently — you only learn about it from the
+// leak"). They now live in `@evalguard/wrapper-core`, the repo's published
+// zero-runtime-dependency leaf — see packages/wrapper-core/src/secret-redaction.ts
+// for why that package and not a new one.
+//
+// Re-exported under the historical underscore names because they are part of
+// this SDK's surface (`vitest.ts` and the A386 egress tests import them) and a
+// rename would be a breaking change for no benefit. `secret-redaction-drift.test.ts`
+// asserts FUNCTION IDENTITY against wrapper-core, so re-forking a local copy
+// fails a test rather than silently shipping.
+export const _redactEmbeddedSecrets = redactEmbeddedSecrets;
+export const _isSecretKey = isSecretKey;
 
-// Value-shape patterns for common secret tokens, anchored to avoid masking
-// ordinary prose. Each must match the WHOLE string (after trim).
-const _SECRET_VALUE_RES: RegExp[] = [
-  /^eg_[A-Za-z0-9_-]{8,}$/, // EvalGuard API keys
-  /^sk-[A-Za-z0-9_-]{16,}$/, // OpenAI-style secret keys
-  /^sk-ant-[A-Za-z0-9_-]{16,}$/, // Anthropic keys
-  /^xox[baprs]-[A-Za-z0-9-]{10,}$/, // Slack tokens
-  /^gh[posru]_[A-Za-z0-9]{20,}$/, // GitHub tokens
-  /^AKIA[0-9A-Z]{16}$/, // AWS access key id
-  /^ya29\.[A-Za-z0-9_-]{20,}$/, // Google OAuth tokens
-  /^Bearer\s+[A-Za-z0-9._-]{12,}$/i, // Authorization: Bearer …
-  /^eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$/, // JWTs
-];
-
-const _REDACTED = "[REDACTED]";
-
-function _looksSecretValue(s: string): boolean {
-  const t = s.trim();
-  if (t.length < 8) return false;
-  return _SECRET_VALUE_RES.some((re) => re.test(t));
-}
-
-/** True when an object KEY name implies its value is a secret. */
-export function _isSecretKey(key: string): boolean {
-  return _SECRET_KEY_RE.test(key);
-}
+const _REDACTED = REDACTED;
+const _looksSecretValue = looksSecretValue;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -287,10 +304,18 @@ function _safeSerialize(
   if (typeof obj === "boolean" || typeof obj === "number") return obj;
   if (typeof obj === "string") {
     if (_looksSecretValue(obj)) return _REDACTED;
-    return obj.length > maxStrLen ? obj.slice(0, maxStrLen) : obj;
+    // A386: a whole-string match catches `{ apiKey: "sk-…" }` but not
+    // `"retrying with sk-… after 401"`. Scan embedded tokens too — same list,
+    // un-anchored — so a credential pasted into a prompt or echoed into an
+    // output does not ship in clear either.
+    const scanned = _redactEmbeddedSecrets(obj);
+    return scanned.length > maxStrLen ? scanned.slice(0, maxStrLen) : scanned;
   }
   if (typeof obj === "bigint") return obj.toString();
-  if (obj instanceof Error) return { name: obj.name, message: obj.message };
+  // Errors nested in inputs/outputs carry the same message text as the span's
+  // own error field, so they need the same scan.
+  if (obj instanceof Error)
+    return { name: obj.name, message: _redactEmbeddedSecrets(obj.message) };
   if (Array.isArray(obj)) {
     const items = obj.slice(0, 100).map((v) => _safeSerialize(v, depth - 1, maxStrLen));
     if (obj.length > 100) items.push(`... +${obj.length - 100} more`);
@@ -299,7 +324,23 @@ function _safeSerialize(
   if (typeof obj === "object") {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      result[k] = _safeSerialize(v, depth - 1, maxStrLen, k);
+      // A386 repair: the KEY went onto the wire untested while the identical
+      // string in value position was redacted. A record keyed by user data is
+      // ordinary — a per-API-key cache, a `{ token: quota }` map, captured
+      // `...args` — so the credential left the process in key position with the
+      // value beside it masked. `keyHint` keeps the ORIGINAL key: the hint
+      // decides whether the VALUE is a secret (`apiKey` → redact), and hinting
+      // off a redacted key would break that.
+      let safeKey = _looksSecretValue(k) ? _REDACTED : _redactEmbeddedSecrets(k);
+      // Two distinct keys can redact to the same string. Suffix rather than
+      // overwrite: dropping a value silently is how a redactor turns into data
+      // loss nobody notices.
+      if (safeKey in result) {
+        let suffix = 2;
+        while (`${safeKey}_${suffix}` in result) suffix++;
+        safeKey = `${safeKey}_${suffix}`;
+      }
+      result[safeKey] = _safeSerialize(v, depth - 1, maxStrLen, k);
     }
     return result;
   }
@@ -356,16 +397,31 @@ class TraceBatcher {
     });
 
     try {
-      await fetch(url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${cfg.apiKey}`,
-          "Content-Type": "application/json",
-          "User-Agent": "evalguard-js/2.0.2-tracing",
+      await followSameHostRedirects(
+        url,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${cfg.apiKey}`,
+            "Content-Type": "application/json",
+            "User-Agent": `evalguard-js/${SDK_VERSION}-tracing`,
+          },
+          body,
+          signal: AbortSignal.timeout(10_000),
         },
-        body,
-        signal: AbortSignal.timeout(10_000),
-      });
+        // Telemetry, not a verdict — but the same rule, for one reason: this
+        // POST carries the org's API key and the customer's span payloads, and
+        // a CROSS-HOST redirect would hand both to whatever host answered with
+        // a `Location`. Fire-and-forget already swallows the rejection.
+        // (2026-08-10, revised 2026-08-12.)
+        //
+        // This config path is the one that most needs the same-host follow:
+        // `_getConfig` strips trailing slashes but does NOT require https, so
+        // `EVALGUARD_BASE_URL=http://evalguard.ai/api` is accepted here and
+        // production answers it with a 301 to https on the SAME host. Under the
+        // blanket refusal every span from such a deployment was dropped.
+        { label: "POST /v1/traces/ingest" },
+      );
     } catch {
       // Best-effort -- never throw into user code
     }
@@ -374,12 +430,17 @@ class TraceBatcher {
 
 const _batcher = new TraceBatcher();
 
-// Register shutdown flush for Node.js
+// Register a shutdown flush for Node.js.
+//
+// `beforeExit` ONLY. A library must never install SIGINT/SIGTERM handlers that
+// call process.exit(): Node runs signal listeners in registration order, and
+// merely importing this module registered ours FIRST, so `process.exit(143)`
+// fired before the host's own SIGTERM handler could drain connections — every
+// in-flight request was killed on each rolling deploy, and Ctrl-C skipped the
+// app's cleanup. `beforeExit` does not alter exit semantics; hosts that want a
+// signal-time flush call the exported `flushTraces()` from their OWN handler.
 if (typeof process !== "undefined" && typeof process.on === "function") {
-  const onExit = () => _batcher.flush();
-  process.on("beforeExit", onExit);
-  process.on("SIGINT", () => { onExit(); process.exit(130); });
-  process.on("SIGTERM", () => { onExit(); process.exit(143); });
+  process.on("beforeExit", () => _batcher.flush());
 }
 
 // ── traceable() ────────────────────────────────────────────────────────

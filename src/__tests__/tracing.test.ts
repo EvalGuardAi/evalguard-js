@@ -142,6 +142,19 @@ describe("flushTraces", () => {
     flushTraces();
     flushTraces();
   });
+
+  it("importing the SDK installs NO SIGINT/SIGTERM handler (host owns shutdown)", () => {
+    // REGRESSION: this module used to register
+    //   process.on("SIGTERM", () => { flush(); process.exit(143); })
+    // at import time. Node runs signal listeners in registration order, so the
+    // SDK's process.exit() fired BEFORE the host's own SIGTERM handler could
+    // drain connections — every in-flight request died on each rolling deploy.
+    // A library may register `beforeExit` (which does not alter exit
+    // semantics) but never a signal handler that exits.
+    expect(process.listenerCount("SIGINT")).toBe(0);
+    expect(process.listenerCount("SIGTERM")).toBe(0);
+    expect(process.listenerCount("beforeExit")).toBeGreaterThan(0);
+  });
 });
 
 describe("configureTracing — runtime updates", () => {
@@ -221,6 +234,48 @@ describe("traceable — secret redaction", () => {
     const inputs = span!.inputs as Record<string, unknown>;
     expect(inputs.arg0).toBe("hello world");
     expect(inputs.arg1).toBe(42);
+  });
+
+  // ── A386 ────────────────────────────────────────────────────────────────
+  // `error` and `errorStack` were assigned RAW in toDict() while every field
+  // beside them went through _safeSerialize. The SAME token was "[REDACTED]"
+  // in inputs and verbatim in error — on the default traceable() path, into a
+  // persisted, dashboard-rendered store.
+  it("redacts a secret embedded in the error message and stack", async () => {
+    const TOKEN = "sk-abcdefghijklmnopqrstuvwx";
+    const fn = traceable(
+      async (_key: string) => {
+        throw new Error(`upstream rejected ${TOKEN} with 401`);
+      },
+      { name: "throwing-call" },
+    );
+    const span = await captureSentSpan(async () => {
+      await expect(fn(TOKEN)).rejects.toThrow();
+    });
+    expect(span).not.toBeNull();
+    // The control: inputs were already redacted before this fix.
+    expect((span!.inputs as Record<string, unknown>).arg0).toBe("[REDACTED]");
+    // The regression: same token, different field.
+    expect(span!.error).not.toContain(TOKEN);
+    expect(span!.error).toContain("[REDACTED]");
+    expect(span!.errorStack as string).not.toContain(TOKEN);
+    // Diagnostics must survive redaction — a scrubber that eats the message is
+    // a different bug, not a fix.
+    expect(span!.error).toContain("upstream rejected");
+    expect(span!.errorStack as string).toContain("Error:");
+  });
+
+  it("redacts a secret embedded mid-sentence in an input string", async () => {
+    // The value test is whole-string anchored (so prose is never masked), which
+    // left `"retry with sk-… now"` shipping in clear.
+    const fn = traceable(async (_a: string) => "ok", { name: "prose-call" });
+    const span = await captureSentSpan(() =>
+      fn("retrying request with Bearer abcdefghijkl1234 after a 401"),
+    );
+    const arg0 = (span!.inputs as Record<string, unknown>).arg0 as string;
+    expect(arg0).not.toContain("abcdefghijkl1234");
+    expect(arg0).toContain("[REDACTED]");
+    expect(arg0).toContain("after a 401");
   });
 });
 

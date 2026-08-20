@@ -28,6 +28,10 @@
 
 import type { EvalGuardConfig } from "./client";
 import { EvalGuard } from "./client";
+// Single redactor for everything this SDK puts on the wire — see
+// `_processTask`. Imported rather than re-derived so there is exactly one
+// secret list; a second copy drifts, and a drifted secret list fails silently.
+import { _redactEmbeddedSecrets } from "./tracing";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -185,7 +189,19 @@ export class EvalGuardReporter {
     this.results = [];
   }
 
-  onFinished(files?: unknown[]): void {
+  /**
+   * Vitest awaits `onFinished` (the Reporter contract allows
+   * `void | Promise<void>`), so the upload MUST be returned, not fired and
+   * forgotten.
+   *
+   * DATA-LOSS FIX: this used `void this._sendResults()`, which returned
+   * synchronously with the POST still in flight. Vitest saw every reporter
+   * finish and exited; Node tore down the process (and the socket) before the
+   * request completed, so CI eval results were silently dropped — no error, no
+   * retry, just a run that never appeared in the dashboard. Awaiting it makes
+   * the upload part of the run.
+   */
+  async onFinished(files?: unknown[]): Promise<void> {
     // Process file results from vitest
     if (Array.isArray(files)) {
       for (const file of files) {
@@ -193,8 +209,8 @@ export class EvalGuardReporter {
       }
     }
 
-    // Send results
-    void this._sendResults();
+    // Send results — awaited so the process cannot exit mid-flight.
+    await this._sendResults();
   }
 
   // Also support the tasks-based API (vitest v1+)
@@ -254,10 +270,24 @@ export class EvalGuardReporter {
       const errors = result?.errors as Record<string, unknown>[] | undefined;
       if (Array.isArray(errors) && errors.length > 0) {
         const err = errors[0];
+        // A386 repair: both of these are POSTed verbatim to /evals/ci by
+        // `_sendResults`, and a stack is the worst carrier of the class — V8
+        // frames name the module and the assertion diff embeds the received
+        // value, so a failing `expect(headers.Authorization).toBe(...)` or a
+        // provider SDK that echoes the key into `err.message` ships the
+        // credential to a persisted, dashboard-rendered store the moment a CI
+        // test fails. The anchored value test cannot see it: an error message
+        // is a sentence CONTAINING a token, never the token itself.
+        //
+        // Redact BEFORE the 2000-char cut — truncating first can slice a token
+        // in half and leave the prefix unmatched, and truncation was never the
+        // control here anyway.
         testResult.error = {
           type: (err.name || "AssertionError") as string,
-          message: (err.message || "Test failed") as string,
-          traceback: ((err.stack || err.stackStr || "") as string).slice(0, 2000),
+          message: _redactEmbeddedSecrets((err.message || "Test failed") as string),
+          traceback: _redactEmbeddedSecrets(
+            (err.stack || err.stackStr || "") as string,
+          ).slice(0, 2000),
         };
       }
     }

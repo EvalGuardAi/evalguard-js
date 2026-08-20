@@ -70,7 +70,20 @@ describe("EvalGuard project auto-resolution", () => {
   it("skips /project/current when an explicit projectId is passed", async () => {
     const mockFn = routedFetch([
       { match: PROJECT_CURRENT, body: { projectId: "should-not-be-used", orgId: "org-1" } },
-      { match: "/security", body: { id: "scan-1" } },
+      // The real started-scan stub shape — securityScan() refuses a 2xx that
+      // carries no scan summary (2026-08-03 fail-closed sweep).
+      {
+        match: "/security",
+        body: {
+          id: "scan-1",
+          status: "passed",
+          score: 100,
+          totalTests: 4,
+          duration: 12,
+          severityCounts: { critical: 0, high: 0, medium: 0, low: 0 },
+          findingsCount: 0,
+        },
+      },
     ]);
     globalThis.fetch = mockFn;
 

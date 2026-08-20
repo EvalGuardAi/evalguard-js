@@ -86,18 +86,62 @@ describe("EvalGuard SDK — agent-tools CRUD + test", () => {
     expect((f.mock.calls[0][1] as RequestInit).method).toBe("GET");
   });
 
-  it("updateAgentTool: PATCH /agent-tools/{id} with the partial body", async () => {
-    const f = mockFetch(enveloped({ ...SAMPLE_TOOL, id: "t1", description: "updated" }));
+  it("updateAgentTool: fetches the current tool then PATCHes the FULL merged object", async () => {
+    // The PATCH route re-validates a full definition (name + parameters + kind
+    // config) and 400s on a bare partial, so updateAgentTool must fetch-merge
+    // and send the whole object (audit 2026-07-15). GET returns the current
+    // tool; PATCH returns the updated one.
+    const current = { ...SAMPLE_TOOL, id: "t1", hasSecret: false };
+    const updated = { ...current, description: "updated" };
+    const f = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue(enveloped(current)),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: vi.fn().mockResolvedValue(enveloped(updated)),
+      });
     globalThis.fetch = f;
     const c = new EvalGuard({ apiKey: "eg_k" });
-    await c.updateAgentTool("t1", { projectId: "p", tool: { description: "updated" } });
-    expect(f.mock.calls[0][0]).toContain("/agent-tools/t1");
-    const init = f.mock.calls[0][1] as RequestInit;
+    const out = await c.updateAgentTool("t1", { projectId: "p", tool: { description: "updated" } });
+
+    // 1) GET the current tool first
+    expect(f).toHaveBeenCalledTimes(2);
+    const getUrl = f.mock.calls[0][0] as string;
+    expect(getUrl).toContain("/agent-tools/t1?");
+    expect(getUrl).toContain("projectId=p");
+    expect((f.mock.calls[0][1] as RequestInit).method).toBe("GET");
+
+    // 2) PATCH the FULL merged definition (not the bare partial)
+    const patchUrl = f.mock.calls[1][0] as string;
+    expect(patchUrl).toContain("/agent-tools/t1");
+    const init = f.mock.calls[1][1] as RequestInit;
     expect(init.method).toBe("PATCH");
-    expect(JSON.parse(String(init.body))).toMatchObject({
-      projectId: "p",
-      tool: { description: "updated" },
+    const sent = JSON.parse(String(init.body));
+    expect(sent.projectId).toBe("p");
+    expect(sent.tool).toMatchObject({
+      name: "lookup_order",
+      type: "rest",
+      description: "updated",
+      parameters: { type: "object" },
+      rest: { method: "GET" },
     });
+    expect(out.description).toBe("updated");
+  });
+
+  it("updateAgentTool: throws when tool missing before any fetch", async () => {
+    const f = mockFetch(enveloped({}));
+    globalThis.fetch = f;
+    const c = new EvalGuard({ apiKey: "eg_k" });
+    // @ts-expect-error intentionally omit required tool to assert the guard
+    await expect(c.updateAgentTool("t1", { projectId: "p" })).rejects.toThrow(/tool/);
+    expect(f).not.toHaveBeenCalled();
   });
 
   it("deleteAgentTool: DELETE /agent-tools/{id}?projectId", async () => {

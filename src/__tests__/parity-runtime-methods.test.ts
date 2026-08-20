@@ -90,8 +90,14 @@ describe("SDK parity runtime methods", () => {
     expect(out.stepsReceived).toBe(2);
   });
 
-  it("runGuardrails POSTs text to /guardrails and returns raw action shape", async () => {
-    const f = mockFetch({ action: "block", reasons: [{ detail: "pii" }], latencyMs: 3 });
+  it("runGuardrails POSTs text to /guardrails and returns the raw checkFirewall shape", async () => {
+    // Wire `reasons[]` items are core FirewallReasons: { rule, type, detail,
+    // severity } (live E2E 2026-07-16 #3) — NOT the old { layer, detail, score }.
+    const f = mockFetch({
+      action: "block",
+      reasons: [{ rule: "PII", type: "pii", detail: "Detected SSN pattern", severity: "critical" }],
+      latencyMs: 3,
+    });
     globalThis.fetch = f;
     const c = new EvalGuard({ apiKey: "eg_k" });
     const out = await c.runGuardrails({ text: "hello", projectId: "p" });
@@ -100,6 +106,11 @@ describe("SDK parity runtime methods", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual({ text: "hello", projectId: "p" });
     expect(out.action).toBe("block");
+    // The typed reason fields are populated at runtime.
+    expect(out.reasons[0].rule).toBe("PII");
+    expect(out.reasons[0].type).toBe("pii");
+    expect(out.reasons[0].detail).toBe("Detected SSN pattern");
+    expect(out.reasons[0].severity).toBe("critical");
   });
 
   it("checkFirewall normalizes FirewallRule[] to category strings + forwards sensitivity/subject", async () => {
@@ -315,5 +326,16 @@ describe("SDK parity runtime methods", () => {
     expect(sent).toMatchObject({ serverId: "srv", toolName: "lookup", arguments: { q: "x" } });
     expect((init.headers as Record<string, string>)["x-evalguard-mcp-run-id"]).toBe("run-9");
     expect(out.decision).toBe("allow");
+  });
+
+  it("getSecurityReport GETs /security/report with assessmentId (route reads assessmentId, not scanId)", async () => {
+    const f = mockFetch({ success: true, data: { report: {} } });
+    globalThis.fetch = f;
+    const c = new EvalGuard({ apiKey: "eg_k" });
+    await c.getSecurityReport("asmt-123");
+    const [url, init] = lastCall(f);
+    expect(init.method).toBe("GET");
+    expect(url).toContain("/security/report?assessmentId=asmt-123");
+    expect(url).not.toContain("scanId=");
   });
 });

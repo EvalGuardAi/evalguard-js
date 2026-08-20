@@ -1,4 +1,5 @@
 import { ExtensionRegistry } from "./extensions";
+import { warnIfSandboxBlocks } from "./sandbox";
 import { SDK_VERSION } from "./version";
 import { EvaluationLogger } from "./eval-logger";
 import type { EvalLoggerParams } from "./eval-logger";
@@ -6,7 +7,25 @@ import type {
   FirewallEngineConfig,
   AdvancedRailsConfig,
   DetectionResult,
+  PromptConfig,
+  PromptTemplate,
+  TemplateLanguage,
+  ToolConfig,
+  ToolEnvironmentVariable,
+  EnvironmentTag,
+  MemoryGovernanceMode,
+  MemoryGovernanceConfig,
+  GuardrailFlagAction,
 } from "@evalguard/core";
+// SENSITIVITY_LEVELS is the single source of truth for the clearance ladder
+// (packages/core/src/intent/index.ts) — imported rather than re-listed so the
+// classifyIntent verdict check cannot drift from the classifier that produces it.
+import { validatePromptConfig, validateToolConfig, SENSITIVITY_LEVELS } from "@evalguard/core";
+// SEC-051 follow-up (2026-08-12). THE same-host redirect rule, imported rather
+// than re-implemented — `@evalguard/wrapper-core` is already a dependency of
+// this package, and a second copy of a security control is how the two drift.
+// See packages/wrapper-core/src/same-host-redirect.ts.
+import { followSameHostRedirects } from "@evalguard/wrapper-core";
 
 // Re-export the core firewall types so SDK consumers can import them from
 // @evalguard/sdk directly (they're already re-exported via `export type *`
@@ -43,7 +62,9 @@ export class EvalGuardError extends Error {
   readonly status?: number;
   /** The underlying error (original fetch TypeError, JSON parse error, etc.). */
   readonly cause?: unknown;
-  /** Server-provided request id (from the {success:false,error:{requestId}} envelope), for support correlation. */
+  /** Server-provided request id for support correlation, resolved from the
+   *  {success:false,error:{requestId}} envelope or the `X-Request-Id` response
+   *  header (populated for every error status, not only 401). */
   readonly requestId?: string;
 
   constructor(message: string, options: { code: string; status?: number; cause?: unknown; requestId?: string }) {
@@ -62,6 +83,237 @@ export class EvalGuardError extends Error {
   }
 }
 
+// ── Indeterminate verdicts (fail-CLOSED response validation) ──────────
+//
+// 2026-08-03. Three fail-open classes were confirmed in SHIPPED EvalGuard
+// clients on one night, two of them independently in two languages:
+//
+//   Java 1.0.8  `FirewallCheckResult.blocked` is a primitive `boolean`, so
+//               Jackson defaults an ABSENT field to false → "not blocked".
+//   Python 2.1.5 `guardrails.py::_translate` defaults an absent `action` to
+//               "allow" at 14 call sites.
+//
+// This SDK shipped the SAME defect in TypeScript's shape. Every
+// verdict-returning method resolved to whatever JSON came back, `request()`
+// unwraps `{success,data}` blindly, and the documented caller pattern
+//
+//     const r = await client.checkFirewall({ input });
+//     if (r.blocked) refuse();          // README + FirewallResult docstring
+//
+// reads `undefined` as "not blocked". Measured against the shipped code
+// (probe, 2026-08-03): a 200 whose verdict field is ABSENT, `{}`,
+// `{success:true,data:null}`, a 200 apiError envelope (`{success:false,…}`),
+// a bare array, a bare string, and `blocked: 0` ALL resolved to ALLOW on
+// checkFirewall / runGuardrails / evaluateDataBoundary. A corporate proxy
+// that rewrites a 502 into a 200 `{"error":"upstream timeout"}`, a
+// differently-versioned server, or a renamed field is enough.
+//
+// THE RULE: a response the client cannot INTERPRET must DENY. An
+// indeterminate verdict is neither "allowed" nor "blocked" — it is "the
+// control did not run" — and it is raised as an `EvalGuardError` with code
+// `INDETERMINATE_VERDICT` so no caller can read it as clean. This is the same
+// fail-closed route `@evalguard/wrapper-core` already takes for the wrappers
+// (`FirewallResponseParseError`, firewall-response.ts).
+//
+// Diagnostics carry key NAMES only, never values: a firewall body echoes
+// fragments of the caller's prompt in `hits[].details`, and this message lands
+// in operator logs.
+
+/** Stable machine code for an unreadable verdict. */
+export const INDETERMINATE_VERDICT_CODE = "INDETERMINATE_VERDICT" as const;
+
+// ── Own-property reads (prototype-pollution containment) ──────────────
+//
+// 2026-08-03 (audit js-requireverdict-own-properties). Every read this module
+// makes on a response body used to be a plain `cursor[key]` / `"key" in obj`,
+// and BOTH walk the PROTOTYPE CHAIN. A single prototype-pollution primitive
+// anywhere in the consumer's process — a vulnerable transitive dependency, a
+// `lodash.merge`-shaped deep-merge over attacker-influenced JSON, a query-string
+// parser — therefore let an EMPTY 200 body present a complete, well-typed
+// verdict to a fail-CLOSED check:
+//
+//     Object.prototype.decision = "allow";
+//     await client.mcpInvoke(...)   // 200 `{}` → resolved as an AUTHORISED allow
+//
+// Proven in a clean consumer against the packed 3.0.0 tarball. The whole point
+// of requireVerdict is that the SDK must not accept a verdict the SERVER did
+// not send; a value the JS runtime synthesised from Object.prototype is the
+// purest form of that. So the reads are own-only, everywhere, unconditionally.
+//
+// TWO surfaces, not one — fixing either alone leaves the bypass fully intact:
+//
+//   1. requireVerdict's traversal (`cursor[key]`) — reads the verdict itself.
+//   2. request()'s apiSuccess unwrap (`"success" in json && "data" in json`) —
+//      with `Object.prototype.data = { decision: "allow" }`, a 200 `{}` makes
+//      request() RETURN that inherited object, whose `decision` is a genuine
+//      OWN property. An own-only requireVerdict validates it happily. Measured:
+//      `unwrapped = {"decision":"allow"}`, `Object.hasOwn(unwrapped,"decision")
+//      === true`. The verdict check and the envelope unwrap are own-only
+//      together or neither is.
+//
+// `OWN` is resolved ONCE at module load, because the obvious counter-move to
+// this very fix is to pollute the test itself: `Object.prototype.hasOwnProperty
+// = () => true` re-opens every `Object.prototype.hasOwnProperty.call(o, k)` site
+// in the process. `Object.hasOwn` is an own property of the `Object`
+// constructor, which a prototype-pollution gadget (which writes through
+// `__proto__`/`constructor.prototype` onto Object.PROTOTYPE) cannot reach at
+// all; capturing it at load additionally survives later direct tampering.
+
+/** Own-property test, resolved at module load (see block comment above). */
+const OWN: (obj: object, key: string) => boolean = (() => {
+  const hasOwn = (Object as { hasOwn?: (o: object, k: PropertyKey) => boolean }).hasOwn;
+  if (typeof hasOwn === "function") return (obj, key) => hasOwn(obj, key);
+  const hop = Object.prototype.hasOwnProperty; // ES2021-and-older runtimes
+  return (obj, key) => hop.call(obj, key);
+})();
+
+/**
+ * Read `obj[key]` ONLY when it is `obj`'s OWN property. An inherited value
+ * reads as `undefined`, i.e. exactly as ABSENT — which every caller here
+ * already treats as fail-closed. Total: never throws, never consults the
+ * prototype chain.
+ */
+function readOwn(obj: object, key: string): unknown {
+  return OWN(obj, key) ? (obj as Record<string, unknown>)[key] : undefined;
+}
+
+/**
+ * Unwrap the standard `{ success, data }` apiSuccess envelope, tolerating a
+ * raw (un-enveloped) payload.
+ *
+ * Both membership tests are OWN-property tests. `"data" in json` follows the
+ * prototype chain, so it is a payload-FABRICATION primitive under prototype
+ * pollution — see the block comment above. Single source of truth for the two
+ * unwrap sites (request() and checkVersionPolicy()) so they cannot drift.
+ */
+function unwrapApiEnvelope(json: unknown): unknown {
+  if (json === null || typeof json !== "object") return json;
+  return OWN(json, "success") && OWN(json, "data") ? (json as { data: unknown }).data : json;
+}
+
+/** What a verdict field must look like for the response to be interpretable. */
+type VerdictFieldKind = "boolean" | "number" | "array" | "enum";
+
+interface VerdictFieldSpec {
+  /** Property path to the verdict field, e.g. `["decision", "allow"]`. */
+  path: readonly string[];
+  kind: VerdictFieldKind;
+  /** For `kind: "enum"` — the complete set of values this client understands. */
+  values?: readonly string[];
+}
+
+/**
+ * Structural summary used in diagnostics — key NAMES only, no values. Mirrors
+ * `describeResponseShape` in wrapper-core/src/firewall-response.ts.
+ */
+function describeVerdictShape(v: unknown): string {
+  if (v === null) return "null";
+  if (v === undefined) return "undefined";
+  if (Array.isArray(v)) return `array(${v.length})`;
+  const t = typeof v;
+  if (t !== "object") return t;
+  const keys = Object.keys(v as Record<string, unknown>);
+  const shown = keys.slice(0, 12);
+  return `object{${shown.join(",")}${keys.length > shown.length ? ",…" : ""}}`;
+}
+
+function indeterminateVerdict(endpoint: string, reason: string, shape: string): EvalGuardError {
+  return new EvalGuardError(
+    `EvalGuard ${endpoint} returned 2xx with a body that carries no usable verdict, so the ` +
+      `check could not be evaluated (INDETERMINATE — treated as a failure, never as "allowed"): ` +
+      `${reason}. Response shape: ${shape}`,
+    { code: INDETERMINATE_VERDICT_CODE },
+  );
+}
+
+/**
+ * Assert that `body` carries every verdict field the caller will branch on,
+ * with the right RUNTIME type, and return it typed. Throws
+ * `EvalGuardError { code: "INDETERMINATE_VERDICT" }` otherwise.
+ *
+ * Wrong-type is rejected as hard as absent, deliberately: `blocked: 0` and
+ * `blocked: "false"` are the two shapes a JS truthiness test gets exactly
+ * backwards, and `action: 0` is not an action.
+ */
+function requireVerdict<T>(
+  body: unknown,
+  endpoint: string,
+  specs: readonly VerdictFieldSpec[],
+): T {
+  // NOTE: there is deliberately NO env-var / config escape hatch here. An
+  // opt-out on a fail-closed control is the next bypass — the flag ends up set
+  // in the one deployment that needed it and never unset.
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw indeterminateVerdict(
+      endpoint,
+      "response body is not a JSON object",
+      describeVerdictShape(body),
+    );
+  }
+  for (const spec of specs) {
+    let cursor: unknown = body;
+    // Diagnostics only — never part of the decision. Distinguishes "the server
+    // omitted this field" from "this process has prototype pollution", which
+    // are the same fail-closed outcome but very different incidents.
+    let inheritedOnly = false;
+    for (let i = 0; i < spec.path.length; i++) {
+      const key = spec.path[i];
+      if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
+        throw indeterminateVerdict(
+          endpoint,
+          `\`${spec.path.slice(0, i).join(".") || "<root>"}\` is not an object, so the ` +
+            `\`${spec.path.join(".")}\` verdict could not be read` +
+            // Same distinction as the leaf case below: an intermediate segment
+            // that exists ONLY on the prototype chain is a pollution symptom,
+            // not a server that omitted a field.
+            (inheritedOnly
+              ? ` — it was ABSENT from the response body and present ONLY on the ` +
+                `prototype chain (inherited values are never accepted as a verdict; ` +
+                `your process almost certainly has a prototype-pollution primitive)`
+              : ""),
+          describeVerdictShape(cursor),
+        );
+      }
+      // OWN properties only. `cursor[key]` walks the prototype chain, so
+      // `Object.prototype.<key> = <a value of the right type>` satisfied this
+      // check on a body that carried nothing — see the block comment above
+      // readOwn. An inherited value reads as ABSENT, which is fail-closed.
+      inheritedOnly = !OWN(cursor, key) && key in cursor;
+      cursor = readOwn(cursor, key);
+    }
+    const field = spec.path.join(".");
+    const ok =
+      spec.kind === "boolean"
+        ? typeof cursor === "boolean"
+        : spec.kind === "number"
+          ? typeof cursor === "number" && Number.isFinite(cursor)
+          : spec.kind === "array"
+            ? Array.isArray(cursor)
+            : typeof cursor === "string" && (spec.values ?? []).includes(cursor);
+    if (!ok) {
+      const expected =
+        spec.kind === "enum"
+          ? `one of ${(spec.values ?? []).map((v) => `"${v}"`).join(" | ")}`
+          : `a ${spec.kind}`;
+      throw indeterminateVerdict(
+        endpoint,
+        `\`${field}\` must be ${expected} — this route always returns one — but it was ` +
+          `${
+            cursor === undefined
+              ? inheritedOnly
+                ? "ABSENT from the response body and present ONLY on the prototype chain " +
+                  "(inherited values are never accepted as a verdict; your process almost " +
+                  "certainly has a prototype-pollution primitive)"
+                : "ABSENT"
+              : `of type ${Array.isArray(cursor) ? "array" : typeof cursor}`
+          }`,
+        describeVerdictShape(body),
+      );
+    }
+  }
+  return body as T;
+}
+
 // ── Idempotency ───────────────────────────────────────────────────────
 
 /**
@@ -77,6 +329,103 @@ function newIdempotencyKey(): string {
   if (cryptoAny?.randomUUID) return cryptoAny.randomUUID();
   const r = () => Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
   return `${r()}${r()}-${r().slice(0, 4)}-4${r().slice(0, 3)}-${r().slice(0, 4)}-${r()}${r().slice(0, 4)}`;
+}
+
+/**
+ * Hard ceiling on any single retry sleep, in ms.
+ *
+ * AUDIT 2026-07-25 (availability). The 429 branch used to be
+ * `retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * 2 ** attempt, 60_000)` —
+ * the 60s cap guarded ONLY the exponential fallback, so a server-supplied
+ * `Retry-After: 3600` was honoured verbatim. With maxRetries = 3 that parks a
+ * single `await client.checkFirewall(...)` for up to three hours inside the
+ * caller's request handler, with no cancellation and no error: the
+ * AbortController bounds the fetch, never the sleep. An edge/CDN under load
+ * shedding (Cloudflare, nginx `limit_req`) emits large Retry-After values
+ * routinely, so this turns OUR rate limit into THEIR outage.
+ */
+export const MAX_RETRY_DELAY_MS = 60_000;
+
+/**
+ * Compute the sleep before the next attempt, bounded and jittered.
+ *
+ * - Honours `Retry-After` (delta-seconds or the HTTP-date form) but CLAMPS it
+ *   to {@link MAX_RETRY_DELAY_MS}; the server hint can shorten a wait, never
+ *   extend it past the ceiling.
+ * - Falls back to exponential backoff when the header is absent/unparseable.
+ * - Applies ±50% jitter so a fleet that rate-limits together does not retry in
+ *   lockstep and re-stampede the recovering origin.
+ *
+ * Exported for tests; not part of the supported public surface.
+ */
+export function computeRetryDelayMs(
+  retryAfterHeader: string | null,
+  attempt: number,
+  now: number = Date.now(),
+): number {
+  let base: number | null = null;
+  if (retryAfterHeader) {
+    const raw = retryAfterHeader.trim();
+    const seconds = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (Number.isFinite(seconds) && seconds > 0) {
+      base = seconds * 1000;
+    } else {
+      // HTTP-date form (RFC 9110 §10.2.3). parseInt() yielded NaN here and the
+      // hint was silently dropped.
+      const at = Date.parse(raw);
+      if (Number.isFinite(at)) base = Math.max(0, at - now);
+    }
+  }
+  if (base === null) base = 1000 * Math.pow(2, attempt);
+  const bounded = Math.min(base, MAX_RETRY_DELAY_MS);
+  return Math.round(bounded * (0.5 + Math.random() * 0.5));
+}
+
+// ── Retry safety ──────────────────────────────────────────────────────
+//
+// The SDK sends an `Idempotency-Key` on every write, but the SERVER only
+// honours it on routes that opt in with `idempotent: true` in
+// apps/web/src/lib/api-handler.ts — a handful, not the ~340 write routes. So a
+// blind 5xx/network retry of a POST whose row already committed (nginx 502 with
+// the response in flight is routine during a deploy) creates a DUPLICATE: two
+// api keys, two team invites, two of whatever the route mints. The caller
+// cannot tell, because the SDK returns the second response.
+//
+// Retry rules:
+//   • GET / HEAD / OPTIONS / DELETE / PUT — idempotent by RFC 9110 §9.2.2;
+//     always safe to retry.
+//   • POST / PATCH — retried ONLY on the routes that honour Idempotency-Key
+//     server-side (below), where a retry replays the first response instead of
+//     re-executing. Everything else surfaces the 5xx to the caller, who knows
+//     whether re-issuing is safe.
+//
+// Keep this list in sync with the `idempotent: true` route options.
+const IDEMPOTENT_WRITE_ROUTES: readonly (string | RegExp)[] = [
+  "/evals",
+  "/security",
+  "/batches",
+  "/team",
+  "/billing",
+  "/billing/activate",
+  "/chargeback",
+  /^\/verticals\/[^/]+\/scan$/,
+];
+
+const ALWAYS_IDEMPOTENT_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE", "PUT"]);
+
+/**
+ * May a failed attempt at `method path` be retried without risking a duplicate
+ * side effect? Conservative by construction: an unknown verb or an unlisted
+ * POST/PATCH route answers `false`.
+ */
+export function isRetriableRequest(method: string, path: string): boolean {
+  const m = method.toUpperCase();
+  if (ALWAYS_IDEMPOTENT_METHODS.has(m)) return true;
+  if (m !== "POST" && m !== "PATCH") return false;
+  const route = (path.split("?")[0] || "/").replace(/\/+$/, "") || "/";
+  return IDEMPOTENT_WRITE_ROUTES.some((r) =>
+    typeof r === "string" ? r === route : r.test(route),
+  );
 }
 
 // ── Client version pinning (enterprise-managed governance tier) ─────────
@@ -103,11 +452,83 @@ function cmpSemver(a: [number, number, number], b: [number, number, number]): nu
   return 0;
 }
 
+// ── Base-URL normalization ─────────────────────────────────────────────
+
+/**
+ * Normalize a user-supplied API base URL to the versioned API root the SDK
+ * calls against (`.../api/v1`). The rest of the EvalGuard ecosystem documents
+ * the base WITHOUT the `/v1` segment — the tracing module, the
+ * `EVALGUARD_BASE_URL` env var, and the docs all use `https://evalguard.ai/api`
+ * — so a consumer who copies that value into `new EvalGuard({ baseUrl })` would
+ * otherwise hit `https://evalguard.ai/api/<path>` and 404 on every call
+ * (live E2E 2026-07-16 #5). The CLI already normalizes on `login` (CHANGELOG
+ * 2.3.2); this applies the same fix at the SDK boundary. We strip trailing
+ * slashes, leave a URL that already ends in `/api/v1` untouched, append the
+ * missing `/v1` to a `.../api` base, and append the full `/api/v1` to a bare
+ * origin.
+ */
+export function normalizeApiBaseUrl(rawUrl: string): string {
+  const trimmed = rawUrl.replace(/\/+$/, "");
+  if (/\/api\/v1$/.test(trimmed)) return trimmed; // already the versioned root
+  if (/\/api$/.test(trimmed)) return `${trimmed}/v1`; // `.../api` → `.../api/v1`
+  return `${trimmed}/api/v1`; // bare origin → `.../api/v1`
+}
+
+// ── Server request-id correlation ──────────────────────────────────────
+
+/** Minimal shape of the standard `{ success:false, error:{ requestId } }`
+ *  error envelope, plus a legacy top-level `requestId`, that an error body may
+ *  carry. */
+interface ErrorEnvelope {
+  error?: { code?: string; message?: string; requestId?: string };
+  message?: string;
+  requestId?: string;
+}
+
+/**
+ * Resolve the server request id for support correlation from an error
+ * response. The auth layer inlines `requestId` in the `{success:false,error}`
+ * envelope (so 401s carried it), but most route-level errors (400/422/500) omit
+ * it from the body — yet the api-handler stamps `X-Request-Id` on EVERY response
+ * (including the 500 fallback). Preferring the body then falling back to the
+ * header means the id is populated for ALL error statuses, not just 401
+ * (live E2E 2026-07-16 #6). `res.headers` is optional-chained so partial test
+ * doubles that omit a `Headers` object don't throw.
+ */
+function extractRequestId(
+  res: { headers?: { get(name: string): string | null } },
+  body: ErrorEnvelope | null | undefined,
+): string | undefined {
+  const fromBody = body?.error?.requestId ?? body?.requestId;
+  if (fromBody) return fromBody;
+  const fromHeader =
+    res.headers?.get("x-evalguard-request-id") ?? res.headers?.get("x-request-id");
+  return fromHeader ?? undefined;
+}
+
+/** Stable machine code for "the version policy could not be read". */
+export const VERSION_POLICY_INDETERMINATE_CODE = "VERSION_POLICY_INDETERMINATE" as const;
+
 export interface VersionPolicyResult {
   allowed: boolean;
   requiredMinimumVersion: string | null;
   requiredMaximumVersion: string | null;
   reason?: string;
+  /**
+   * The policy could NOT be read — the endpoint was unreachable/timed out,
+   * answered non-2xx, or returned a 2xx body carrying no policy (a 200
+   * `{success:false,…}` envelope, `data:null`, HTML from a captive proxy).
+   *
+   * `allowed` is `false` in that case, because the client cannot prove this
+   * version is inside the org's pinned range — NOT because a pin was violated.
+   * Branch on this field when you need to tell the two apart; the previous
+   * behaviour (silently reporting `allowed: true` on every failure shape) meant
+   * anyone who could black-hole `/client/policy` turned enterprise version
+   * pinning off, and nothing else enforces it: no server route consults
+   * `gateway_managed_policy.required_min_version` on ordinary API calls — only
+   * `/client/policy` itself does.
+   */
+  indeterminate?: boolean;
 }
 
 /** Cadence at which a virtual key's spend cap (and `current_period_spent_usd`)
@@ -223,6 +644,162 @@ export interface DataBoundaryEvalDecision {
   authzDecision?: { allowed: boolean; outcome: string; reason: string };
 }
 
+// ── Agent memory-governance policy types (Wave 3) ───────────────────────
+// The admin-managed policy that governs durable agent-memory writes org-wide
+// (or per-project): mode off/monitor/enforce + config knobs (poisoning-screen
+// confidence threshold, HITL-on-rewrite, provenance-required). CRUD over
+// /agent-memory/governance. The core MemoryGovernanceMode / MemoryGovernanceConfig
+// types are re-exported from @evalguard/core (via `export type * from` in index.ts).
+
+/** A stored agent-memory-governance policy, exactly as GET/PUT/POST
+ *  /api/v1/agent-memory/governance returns it (camelCase, from the store's
+ *  snake_case → app mapping). `config` is a partial of the core
+ *  {@link MemoryGovernanceConfig} (`thresholds.poisonMinConfidence`,
+ *  `requireApprovalOnRewrite`, `requireProvenance`). */
+export interface MemoryGovernancePolicyRecord {
+  id: string;
+  orgId: string;
+  /** null = the org-wide policy; a value = a project-scoped policy. */
+  projectId: string | null;
+  enabled: boolean;
+  mode: MemoryGovernanceMode;
+  config: Partial<MemoryGovernanceConfig>;
+  createdBy: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ── Gateway guardrail-config types (Wave 2) ─────────────────────────────
+// Per-project, opt-in `gateway_guardrail_config` rows: the inline guardrails
+// the gateway proxy wires into the hot path (partner-vendor adapters + the
+// local presets). CRUD over /gateway/guardrails. Admin role required (same gate
+// as the route). Mirrors the memory-governance policy CRUD above.
+
+/** The local guardrail presets that make NO external call and therefore MUST
+ *  NOT carry a `secretRef`: the two content presets (`local-firewall` /
+ *  `moderated-firewall`) and the two Wave-2 agent guardrails
+ *  (`data-not-instructions` / `tool-call-circuit-breaker`). Every other vendor
+ *  (`aporia` / `lakera` / …) resolves a stored key and REQUIRES a `secretRef`.
+ *  Canonical source: `ALLOWED_GUARDRAIL_VENDORS`'s local half in
+ *  apps/web/src/lib/gateway-guardrail-config.ts. */
+export const LOCAL_GUARDRAIL_VENDORS = [
+  "local-firewall",
+  "moderated-firewall",
+  "data-not-instructions",
+  "tool-call-circuit-breaker",
+] as const;
+export type LocalGuardrailVendor = (typeof LOCAL_GUARDRAIL_VENDORS)[number];
+
+/** True when `vendor` is a dependency-free local preset (no external call, no
+ *  `secretRef`). Used to model the local-vs-vendor secretRef rule client-side
+ *  so a bad config fails fast instead of round-tripping to a 400. */
+export function isLocalGuardrailVendor(vendor: string): vendor is LocalGuardrailVendor {
+  return (LOCAL_GUARDRAIL_VENDORS as readonly string[]).includes(vendor);
+}
+
+/** A stored gateway guardrail-config row, normalized to camelCase from the raw
+ *  snake_case row GET/POST /api/v1/gateway/guardrails returns (the route
+ *  projects the DB columns directly, unlike the memory-governance route which
+ *  maps in its store). `secretRef` points at a stored `provider_keys` row and is
+ *  ALWAYS `null` for a {@link LocalGuardrailVendor}. */
+export interface GuardrailConfigRecord {
+  id: string;
+  orgId: string;
+  projectId: string;
+  vendor: string;
+  /** Ordered failover chain; `[vendor]` for a single-vendor row. */
+  vendorChain: string[] | null;
+  /** GuardrailError categories that advance the chain to the next vendor. */
+  fallbackOnErrors: string[] | null;
+  /** Non-secret vendor knobs (endpoint / profile / baseUrl) — never a raw key. */
+  config: Record<string, unknown>;
+  /** A `provider_keys` row id for vendor adapters; `null` for local presets. */
+  secretRef: string | null;
+  onFlag: GuardrailFlagAction;
+  checkRequest: boolean;
+  checkResponse: boolean;
+  tokenizePii: boolean;
+  enabled: boolean;
+  priority: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Raw snake_case `gateway_guardrail_config` row exactly as GET/POST
+ * /gateway/guardrails returns it (the route projects DB columns directly).
+ * {@link mapGuardrailConfigRow} normalizes it into the camelCase
+ * {@link GuardrailConfigRecord} the SDK's typed surface promises, mirroring the
+ * {@link mapEvalRunRow} pattern (raw rows would otherwise leave
+ * `orgId`/`onFlag`/`secretRef`/… `undefined` at runtime).
+ */
+interface GuardrailConfigWireRow {
+  id: string;
+  org_id: string;
+  project_id: string;
+  vendor: string;
+  vendor_chain?: string[] | null;
+  fallback_on_errors?: string[] | null;
+  config?: Record<string, unknown> | null;
+  secret_ref?: string | null;
+  on_flag: GuardrailFlagAction;
+  check_request: boolean;
+  check_response: boolean;
+  tokenize_pii: boolean;
+  enabled: boolean;
+  priority: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Map a raw {@link GuardrailConfigWireRow} to the declared camelCase
+ *  {@link GuardrailConfigRecord}. */
+function mapGuardrailConfigRow(row: GuardrailConfigWireRow): GuardrailConfigRecord {
+  return {
+    id: row.id,
+    orgId: row.org_id,
+    projectId: row.project_id,
+    vendor: row.vendor,
+    vendorChain: row.vendor_chain ?? null,
+    fallbackOnErrors: row.fallback_on_errors ?? null,
+    config: row.config ?? {},
+    secretRef: row.secret_ref ?? null,
+    onFlag: row.on_flag,
+    checkRequest: row.check_request,
+    checkResponse: row.check_response,
+    tokenizePii: row.tokenize_pii,
+    enabled: row.enabled,
+    priority: row.priority,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/** Params for {@link EvalGuard.upsertGuardrailConfig}. Idempotent on
+ *  (projectId, vendor). For a {@link LocalGuardrailVendor}, omit `secretRef`
+ *  (the client throws if one is passed); for every other vendor, `secretRef` is
+ *  required. */
+export interface UpsertGuardrailConfigParams {
+  orgId: string;
+  projectId: string;
+  vendor: string;
+  /** Non-secret vendor knobs (endpoint / profile / baseUrl). */
+  config?: Record<string, unknown>;
+  /** Optional vendor failover chain; `vendorChain[0]` MUST equal `vendor`. */
+  vendorChain?: string[];
+  /** GuardrailError categories that advance the chain to the next vendor. */
+  fallbackOnErrors?: string[];
+  /** A stored `provider_keys` row id. Required for vendor adapters; MUST be
+   *  omitted / null for a {@link LocalGuardrailVendor}. */
+  secretRef?: string | null;
+  onFlag?: GuardrailFlagAction;
+  checkRequest?: boolean;
+  checkResponse?: boolean;
+  tokenizePii?: boolean;
+  enabled?: boolean;
+  priority?: number;
+}
+
 // ── Config ────────────────────────────────────────────────────────────
 
 export interface EvalGuardConfig {
@@ -270,11 +847,65 @@ export interface EvalRun {
   name: string;
   status: "pending" | "running" | "passed" | "failed" | "error";
   score: number | null;
-  maxScore: number;
+  /**
+   * Maximum achievable score. Optional because the list endpoint (GET /evals,
+   * backing {@link EvalGuard.listEvals}) does NOT project `max_score` — so it is
+   * genuinely absent on list rows rather than fabricated. Present when a
+   * response carries it.
+   */
+  maxScore?: number;
   duration: number | null;
   createdAt: string;
   completedAt?: string;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * Raw snake_case eval-run row exactly as GET /evals returns it (the DB row
+ * projection). {@link mapEvalRunRow} normalizes it into the camelCase
+ * {@link EvalRun} the SDK's typed surface promises. (Live E2E 2026-07-16 #2:
+ * `listEvals()` returned these raw rows, so `createdAt`/`completedAt`/
+ * `projectId`/`metadata` were all `undefined` at runtime.)
+ */
+interface EvalRunWireRow {
+  id: string;
+  name: string;
+  model?: string | null;
+  status: EvalRun["status"];
+  score?: number | null;
+  config?: Record<string, unknown> | null;
+  created_at: string;
+  completed_at?: string | null;
+  created_by?: string | null;
+  duration?: number | null;
+  /** Present only if a future/other endpoint projects it (list route omits it). */
+  max_score?: number | null;
+  /** Present only if a future/other endpoint projects it (list route omits it). */
+  project_id?: string | null;
+}
+
+/**
+ * Map a raw {@link EvalRunWireRow} to the declared camelCase {@link EvalRun}.
+ * `projectId` falls back to the query-scoped project id when the row omits
+ * `project_id` (the list route filters by it but does not select it), so every
+ * returned run is correctly scoped. Optional wire fields (`completed_at`,
+ * `config`, `max_score`) are only set when present, keeping the runtime object
+ * honest with the declared optional-ness.
+ */
+function mapEvalRunRow(row: EvalRunWireRow, scopedProjectId: string): EvalRun {
+  const run: EvalRun = {
+    id: row.id,
+    projectId: row.project_id ?? scopedProjectId,
+    name: row.name,
+    status: row.status,
+    score: row.score ?? null,
+    duration: row.duration ?? null,
+    createdAt: row.created_at,
+  };
+  if (row.max_score != null) run.maxScore = row.max_score;
+  if (row.completed_at) run.completedAt = row.completed_at;
+  if (row.config) run.metadata = row.config;
+  return run;
 }
 
 export interface CaseResult {
@@ -295,6 +926,79 @@ export interface EvalResult {
   passRate: number;
   totalLatency: number;
   totalTokens: number;
+}
+
+/**
+ * What POST /evals actually returns: a "started" run STUB, not a finished
+ * {@link EvalResult}. The server inserts the run as `running` and fires the
+ * model execution in the background (fire-and-forget), returning 201 with just
+ * the run id + counts immediately. Poll {@link EvalGuard.getEvalRun} for the
+ * scored result. (Audit 2026-07-15 #2: `eval()` was mistyped `EvalResult`, so
+ * consumers reading `.score`/`.passRate` off the returned stub got undefined/NaN.)
+ */
+export interface EvalStartedRun {
+  /** The created run id — pass to {@link EvalGuard.getEvalRun}. */
+  id: string;
+  /** Always "running" on create (the model runs in the background). */
+  status: "running" | "pending" | string;
+  /** Number of test cases queued (0 for external / imperative-logger runs). */
+  totalTests: number;
+  model: string;
+  /** True for external (imperative {@link EvaluationLogger}) runs. */
+  external?: boolean;
+  message?: string;
+}
+
+/** One mapped per-case result row from GET /evals/{runId}. */
+export interface EvalRunCaseResult {
+  id: string;
+  test_case_index: number;
+  input: string;
+  expected: string | null;
+  output: string;
+  scores: Record<string, { score: number; passed: boolean; reason?: string }>;
+  score: number;
+  latency_ms: number;
+  cost: number;
+  passed: boolean;
+}
+
+/** Aggregated summary block from GET /evals/{runId}. */
+export interface EvalRunSummary {
+  totalCases: number;
+  passedCases: number;
+  failedCases: number;
+  /** Fraction of cases that passed, 0..1. */
+  passRate: number;
+  /** Mean per-case score, 0..1. */
+  avgScore: number;
+  totalLatency: number;
+  totalCost: number;
+}
+
+/**
+ * Full result of {@link EvalGuard.getEvalRun}. The endpoint returns the
+ * eval_run row (`run`) + per-case `results` + an aggregate `summary`, and —
+ * since the 2026-07 backend fix — ALSO the run's `status`/`score`/`passRate`
+ * FLAT at the top level. The SDK reads those flat fields when present and
+ * otherwise derives them from `run`/`summary`, so `status`/`score`/`passRate`
+ * are always populated regardless of backend version (back-compat). (Audit
+ * 2026-07-15 #2: `getEvalRun()` was mistyped `EvalRun`, but the wire shape is
+ * `{ run, results, summary }`, so `.status`/`.score` were always undefined.)
+ */
+export interface EvalRunDetail {
+  /** Terminal / most-recent run status (flat). */
+  status: EvalRun["status"] | null;
+  /** Aggregate score on a 0..1 scale, null until scored (flat). */
+  score: number | null;
+  /** Fraction of cases that passed, 0..1, null when not computable (flat). */
+  passRate: number | null;
+  /** The full eval_run row (null on a malformed / legacy response). */
+  run: EvalRun | null;
+  /** Per-case results (empty array when none). */
+  results: EvalRunCaseResult[];
+  /** Aggregated summary (null on older servers that omit it). */
+  summary: EvalRunSummary | null;
 }
 
 export interface CompareEvalsParams {
@@ -375,6 +1079,38 @@ export interface SecurityFinding {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * What POST /security actually returns: a started-scan STUB, not a finished
+ * {@link SecurityScanResult}. The route inserts the scan, runs the probes, and
+ * returns 201 with just the id + summary counts — the per-finding detail lives
+ * behind {@link EvalGuard.getScan}. Poll `getScan(id)` for {@link SecurityFinding}
+ * rows. (Live E2E 2026-07-16 #4: `securityScan()` was mistyped
+ * `SecurityScanResult`, so consumers reading `.findings`/`.passRate` off the
+ * returned stub got `undefined`/`NaN` — the identical class of bug already fixed
+ * for `eval()` → {@link EvalStartedRun}.)
+ */
+export interface SecurityScanStartedRun {
+  /** The created scan id — pass to {@link EvalGuard.getScan}. */
+  id: string;
+  /** Terminal status assigned on completion (e.g. "passed" | "failed" | "error"). */
+  status: string;
+  /** Pass score on a 0–100 scale. */
+  score: number;
+  /** Number of attack probes executed. */
+  totalTests: number;
+  /** Wall-clock scan duration in milliseconds. */
+  duration: number;
+  /** Failing-finding counts bucketed by severity. */
+  severityCounts: {
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+  };
+  /** Total number of findings recorded (fetch them via {@link EvalGuard.getScan}). */
+  findingsCount: number;
+}
+
 export interface SecurityScanResult {
   findings: SecurityFinding[];
   passRate: number;
@@ -442,7 +1178,7 @@ export interface PurlLookupResult {
 }
 
 // ── Per-CVE waiver / ignore policy types (G2) ──────────────────────────
-// snyk `.snyk`-style: waive a (CVE, package) tuple so it stops failing the
+// Waiver-file model: waive a (CVE, package) tuple so it stops failing the
 // supply-chain CI gate while the finding stays visible.
 
 export interface CveWaiverInput {
@@ -517,6 +1253,23 @@ export interface SbomMonitorAlertableCve {
 export interface SbomMonitorRunResult {
   projectId: string;
   vulnCount: number;
+  /**
+   * COUNT of newly-seen CVEs this run — the numeric sibling of `newVulns`,
+   * equal to `newVulns.length`.
+   *
+   * Added 2026-08-09 to TYPE a field the route already emits
+   * (`apps/web/src/app/api/v1/sbom-monitor/run/route.ts`). `newVulns` stays
+   * the ARRAY and is deliberately NOT renamed: `apps/cli` iterates it and the
+   * PUBLISHED @evalguard/sdk types it as `SbomMonitorAlertableCve[]`, so a
+   * rename would break a shipped surface to fix one dashboard page. The count
+   * instead takes the name its three neighbours already establish.
+   *
+   * OPTIONAL on purpose: a self-hosted deployment older than that route omits
+   * the field entirely, and this SDK is version-skewed against those. Read it
+   * as `newVulnCount ?? newVulns.length` when a number is needed
+   * unconditionally.
+   */
+  newVulnCount?: number;
   kevCount: number;
   highEpssCount: number;
   newVulns: SbomMonitorAlertableCve[];
@@ -765,14 +1518,18 @@ export interface Plugin {
 export interface FirewallRule {
   id: string;
   name: string;
-  type: "pii" | "injection" | "toxic" | "topic" | "custom";
+  /** Mirrors core's `FirewallRuleType`. `"secrets"` added 2026-08-05,
+   *  `"known-bad"` (EICAR / GTUBE / GTphish canaries) added 2026-08-06 — see
+   *  packages/core/src/security/firewall.ts. An unrecognised value is not
+   *  ignored: core fails CLOSED on it (blocks) rather than skipping the rule. */
+  type: "pii" | "injection" | "toxic" | "topic" | "custom" | "secrets" | "known-bad";
   enabled: boolean;
   config?: Record<string, unknown>;
 }
 
 /**
- * Sensitivity dial for {@link EvalGuard.checkFirewall} (parity with Lakera's
- * L1–L4). Accepts the level name or its ordinal (1–4). When unset, the engine's
+ * Sensitivity dial for {@link EvalGuard.checkFirewall} — a four-level L1–L4
+ * scale. Accepts the level name or its ordinal (1–4). When unset, the engine's
  * L2 ("balanced") baseline applies, so existing callers are unchanged.
  */
 export type FirewallSensitivity = "monitor" | "balanced" | "strict" | "lockdown" | 1 | 2 | 3 | 4;
@@ -1181,10 +1938,39 @@ export interface RunGuardrailsParams {
   projectId?: string;
 }
 
+/** One entry in {@link GuardrailsCheckResult.reasons} — the wire shape of a
+ *  core `FirewallReason` (POST /guardrails returns the raw `checkFirewall()`
+ *  result). (Live E2E 2026-07-16 #3: the declared `{layer?,detail,score?}` never
+ *  matched the wire, which is `{rule,type,detail,severity}`.) */
+export interface GuardrailsReason {
+  /** The name of the firewall rule that fired. */
+  rule: string;
+  /** The rule category that matched, or `"invalid-rule"` when the server could
+   *  NOT run a configured rule (unknown `type`) and therefore blocked rather
+   *  than reporting a pass it could not vouch for. */
+  type: "pii" | "injection" | "toxic" | "topic" | "custom" | "secrets" | "invalid-rule" | string;
+  /** Human-readable detail of what was detected. */
+  detail: string;
+  /** Severity of the match. */
+  severity: "critical" | "high" | "medium" | "low" | string;
+}
+
+/**
+ * Every `action` this client knows how to interpret.
+ *
+ * The wire values are core `FirewallResult["action"]` —
+ * `"allow" | "block" | "flag"` (packages/core/src/security/firewall.ts:35).
+ * `"redact"` is included because {@link GuardrailsCheckResult} has always
+ * declared it publicly. Anything outside this set is INDETERMINATE: a caller
+ * writing `if (res.action === "block")` would read an unknown action as
+ * permission, which is exactly the fail-open this list exists to prevent.
+ */
+export const GUARDRAIL_ACTIONS = ["allow", "block", "flag", "redact"] as const;
+
 /** Result of {@link EvalGuard.runGuardrails} (POST /guardrails) — raw checkFirewall() shape. */
 export interface GuardrailsCheckResult {
   action: "allow" | "redact" | "block" | string;
-  reasons: Array<{ layer?: string; detail: string; score?: number }>;
+  reasons: GuardrailsReason[];
   latencyMs: number;
   [key: string]: unknown;
 }
@@ -1466,12 +2252,162 @@ export interface McpInvokeParams {
   runId?: string;
 }
 
+/**
+ * Every `decision` this client knows how to interpret on a 2xx from
+ * POST /mcp/invoke.
+ *
+ * The gateway only emits a 2xx when the decision pipeline let the call
+ * proceed — every deny code is a 403 (`apiError(reason, 403, decision)`,
+ * apps/web/src/app/api/v1/mcp/invoke/route.ts), which `request()` already
+ * raises as an `EvalGuardError`. So the reachable set is the allowed=true
+ * decisions plus the 202 durable-HITL suspend:
+ *
+ *   allow                   the enforcement cascade permitted the call
+ *   honeypot_triggered      a decoy tool: the caller is served a benign 200
+ *                           while the trip is alerted out-of-band
+ *   pending_human_approval  202 — SUSPENDED pending a human decision; the
+ *                           tool was NOT executed
+ *   strip_ungrounded /      the two other allowed=true EnforcementDecision
+ *   spotlight_untrusted     codes (packages/core/src/mcp-gateway/enforcer.ts);
+ *                           the pipeline does not map them today, but they
+ *                           mean "the call proceeded with a mutated result",
+ *                           so accepting them cannot fail open.
+ *
+ * Anything outside this set is a decision this client cannot interpret —
+ * including ABSENT. A caller writing `if (r.decision !== "allow") refuse()`
+ * survives that, but `if (r.decision.startsWith("deny")) refuse()` (and every
+ * caller that just consumes `r.response`) reads it as permission for a tool
+ * call that no gateway pipeline ever authorised.
+ */
+export const MCP_INVOKE_DECISIONS = [
+  "allow",
+  "honeypot_triggered",
+  "pending_human_approval",
+  "strip_ungrounded",
+  "spotlight_untrusted",
+] as const;
+
 export interface McpInvokeResult {
-  decision: string;
+  /**
+   * One of {@link MCP_INVOKE_DECISIONS} on every response this client accepts.
+   * Typed as `| string` (like {@link GuardrailsCheckResult.action}) so the
+   * published surface stays back-compatible for consumers that compare it to
+   * their own constants.
+   */
+  decision: "allow" | "honeypot_triggered" | "pending_human_approval" | string;
   reason: string;
   response: unknown;
   latencyMs: number;
   failover?: { fromServerId: string; toServerId: string };
+}
+
+// ── Online evaluations (production sampling) ───────────────────────────
+
+/** A production online-eval sampler: scores a sampled % of live traffic. */
+export interface OnlineEvalSampler {
+  id: string;
+  project_id: string;
+  name: string;
+  enabled: boolean;
+  sample_rate: number;
+  max_per_hour: number;
+  scorer_keys: string[];
+  model_filter: string[];
+  execution_mode: "sync" | "async";
+  last_run_at: string | null;
+  last_run_sampled: number | null;
+  last_run_scored: number | null;
+  last_run_skipped: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One scored online-eval result row over the query window. */
+export interface OnlineEvalResult {
+  id: string;
+  sampler_id: string;
+  scorer_key: string;
+  score: number | null;
+  passed: boolean | null;
+  duration_ms: number | null;
+  error: string | null;
+  occurred_at: string;
+}
+
+/** Per-scorer aggregate over the window returned by listOnlineEvals. */
+export interface OnlineEvalAggregate {
+  total: number;
+  passRate: number;
+  errorRate: number;
+  p95DurationMs: number | null;
+}
+
+export interface OnlineEvalsSummary {
+  samplers: OnlineEvalSampler[];
+  recentResults: OnlineEvalResult[];
+  aggregates: Record<string, OnlineEvalAggregate>;
+  windowSince: string;
+}
+
+export interface CreateOnlineEvalSamplerInput {
+  projectId: string;
+  name: string;
+  sample_rate?: number;
+  max_per_hour?: number;
+  scorer_keys?: string[];
+  model_filter?: string[];
+  execution_mode?: "sync" | "async";
+  enabled?: boolean;
+}
+
+export interface UpdateOnlineEvalSamplerInput {
+  enabled?: boolean;
+  sample_rate?: number;
+  max_per_hour?: number;
+  scorer_keys?: string[];
+  model_filter?: string[];
+  execution_mode?: "sync" | "async";
+}
+
+// ── Prompt optimizer ───────────────────────────────────────────────────
+
+export type PromptOptimizeStrategy =
+  | "meta-prompt"
+  | "few-shot"
+  | "genetic"
+  | "bootstrap"
+  | string;
+
+export interface OptimizePromptInput {
+  projectId: string;
+  prompt: string;
+  strategy: PromptOptimizeStrategy;
+  evalCases: Array<{ input: string; expectedOutput?: string }>;
+  scorers: string[];
+  targetModel?: string;
+  maxIterations?: number;
+  targetScore?: number;
+  costCeilingUsd?: number;
+  /** genetic-strategy knobs */
+  populationSize?: number;
+  mutationRate?: number;
+  crossoverRate?: number;
+  eliteCount?: number;
+  /** few-shot / bootstrap knob */
+  maxExamples?: number;
+}
+
+export interface OptimizePromptResult {
+  optimizedPrompt: string;
+  originalScore: number;
+  optimizedScore: number;
+  improvementPercent: number;
+  strategy: string;
+  iterations: number;
+  changelog: unknown[];
+  durationMs: number;
+  targetModel: string;
+  costUsd: number;
 }
 
 // ── Client ────────────────────────────────────────────────────────────
@@ -1482,8 +2418,8 @@ export class EvalGuard {
   private subject: SubjectContext | null;
   /**
    * Per-instance registry of customer-defined plugins / strategies / scorers.
-   * Promptfoo gap closer: lets callers extend the 249 built-in attack
-   * plugins from their own TS code without forking the monorepo.
+   * Lets callers extend the 249 built-in attack plugins from their own TS
+   * code without forking the monorepo.
    * See packages/sdk/src/extensions.ts for the type surface.
    */
   private extensions: import("./extensions").ExtensionRegistry;
@@ -1494,10 +2430,15 @@ export class EvalGuard {
    * passed projectId always wins and skips this.
    */
   private resolvedProjectId?: string;
+  /**
+   * Default org resolved lazily from GET /project/current and cached for the
+   * lifetime of this client, mirroring {@link resolvedProjectId}. Used by
+   * org-scoped methods (e.g. {@link createDataSource}) when `orgId` is omitted.
+   */
+  private resolvedOrgId?: string;
 
   constructor(config: EvalGuardConfig) {
     this.apiKey = config.apiKey;
-    const baseUrl = config.baseUrl ?? "https://evalguard.ai/api/v1";
 
     // Enforce HTTPS for non-local URLs
     if (config.baseUrl) {
@@ -1519,7 +2460,13 @@ export class EvalGuard {
       }
     }
 
-    this.baseUrl = baseUrl;
+    // Normalize to the versioned API root so a base copied from the docs / env
+    // convention (`https://evalguard.ai/api`, no `/v1`) or given with a trailing
+    // slash still resolves — otherwise every call 404s (live E2E 2026-07-16 #5).
+    // The hosted default already includes `/api/v1`.
+    this.baseUrl = config.baseUrl
+      ? normalizeApiBaseUrl(config.baseUrl)
+      : "https://evalguard.ai/api/v1";
     this.subject = null;
     // Use static import (was a runtime require under CJS — broken in
     // vitest ESM with "Cannot find module './extensions'"). Cost is the
@@ -1527,12 +2474,21 @@ export class EvalGuard {
     // tree-shaking means consumers that never use() pay nothing in the
     // final bundle anyway.
     this.extensions = new ExtensionRegistry();
+
+    // Sandbox awareness. Inside a NemoClaw/OpenClaw sandbox whose egress
+    // allowlist omits our host, every call below fails as an opaque
+    // `TypeError: fetch failed` with no cause worth reading, and the fix is one
+    // line in a YAML file the operator already owns. Warns at most once per
+    // host, only when a policy was successfully read AND excludes the host,
+    // and never throws — see packages/sdk/src/sandbox.ts on why this is
+    // advisory. Silence with EVALGUARD_SUPPRESS_SANDBOX_WARNING=1.
+    warnIfSandboxBlocks(this.baseUrl);
   }
 
   /**
-   * Register a custom plugin, strategy, or scorer. Mirrors Promptfoo's
-   * `redteam.Plugins / Strategies / Graders` extension surface — closes
-   * the gap our competitor analysis flagged.
+   * Register a custom plugin, strategy, or scorer — a customer-defined
+   * red-team plugin, eval scorer, or attack strategy, usable at runtime
+   * without forking the monorepo.
    *
    *   import { EvalGuard, definePlugin } from "@evalguard/sdk";
    *   const myPlugin = definePlugin({
@@ -1604,23 +2560,48 @@ export class EvalGuard {
    *
    * Returns `{ allowed: true }` (unpinned) when the org sets no version bounds —
    * the default, so existing integrations are unaffected. The check is purely
-   * a READ; it never mutates anything. On a network/endpoint error it returns
-   * `allowed: true` (fail-open: a transient policy-read blip must not brick the
-   * customer's whole SDK fleet — the server ALSO sees the version header on every
-   * request and can enforce there).
+   * a READ; it never mutates anything.
+   *
+   * AUDIT 2026-08-03 (sdk-mcpinvoke-failopen, item 3). This used to return
+   * `{ allowed: true }` on EVERY failure shape — connection refused, timeout,
+   * 401/404/500, and a 200 carrying a `{success:false,…}` error envelope — on
+   * the stated grounds that "the server ALSO sees the version header on every
+   * request and can enforce there". It does not: `checkClientVersion` /
+   * `gateway_managed_policy.required_min_version` are read by exactly one route,
+   * `/api/v1/client/policy` (the advisory endpoint this method calls). There is
+   * no other server-side gate, so the client WAS the enforcement point and
+   * anyone able to black-hole one GET disabled enterprise version pinning for
+   * the whole fleet.
+   *
+   * Now: a policy that could not be READ is {@link VersionPolicyResult.indeterminate}
+   * — `allowed: false` with `indeterminate: true`, never a fabricated "allowed".
+   * A genuinely unpinned org still returns `allowed: true`, so nothing changes
+   * for a reachable endpoint.
    */
   async checkVersionPolicy(): Promise<VersionPolicyResult> {
-    let policy: { requiredMinimumVersion?: string | null; requiredMaximumVersion?: string | null } = {};
+    const indeterminate = (why: string): VersionPolicyResult => ({
+      allowed: false,
+      indeterminate: true,
+      requiredMinimumVersion: null,
+      requiredMaximumVersion: null,
+      reason:
+        `EvalGuard could not read this organization's client version policy (${why}), so ` +
+        `@evalguard/sdk ${SDK_VERSION} cannot be confirmed to be within the pinned range ` +
+        `(INDETERMINATE — treated as a failure, never as "allowed"). This is NOT a pin ` +
+        `violation: branch on \`indeterminate\` if your deployment must proceed anyway.`,
+    });
+
+    let json: unknown;
     try {
-      // Best-effort + FAIL-OPEN: a version-policy read must never brick or even
-      // stall the client, so this uses a 3s timeout and NO retry — bypassing
-      // request()'s 3x exponential backoff (which can take several seconds on a
-      // network blip and would hang an SDK init).
+      // A 3s timeout and NO retry — bypassing request()'s 3x exponential
+      // backoff, which can take several seconds on a network blip and would
+      // hang an SDK init.
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 3000);
       try {
-        const res = await fetch(
-          `${this.baseUrl}/client/policy?version=${encodeURIComponent(SDK_VERSION)}`,
+        const policyUrl = `${this.baseUrl}/client/policy?version=${encodeURIComponent(SDK_VERSION)}`;
+        const res = await followSameHostRedirects(
+          policyUrl,
           {
             method: "GET",
             headers: {
@@ -1630,36 +2611,106 @@ export class EvalGuard {
             },
             signal: controller.signal,
           },
+          // See request(). This endpoint is the SOLE enforcement point for
+          // enterprise version pinning, so a redirect-supplied
+          // `versionCheck.allowed:true` from ANOTHER HOST would forge an
+          // in-policy verdict. A refusal throws, which lands on the catch below
+          // -> indeterminate (deny). Same-host hops (a trailing-slash 308, an
+          // http->https 301) are followed so a normalising origin does not turn
+          // enterprise version pinning into a hard failure.
+          { label: `GET /client/policy` },
         );
-        const json = (await res.json()) as { data?: typeof policy } & typeof policy;
-        // API responses are enveloped as { success, data } — unwrap if present.
-        // A non-2xx / error body simply yields no min/max → treated as unpinned
-        // (fail-open), so no explicit res.ok gate is needed.
-        policy = json && typeof json === "object" && json.data ? json.data : json;
+        // A non-2xx is not a policy. 401 (revoked key), 403 (plan gate), 404
+        // (older server), 5xx — none of them prove this client is in policy.
+        if (!res.ok) return indeterminate(`the endpoint answered HTTP ${res.status}`);
+        json = (await res.json()) as unknown;
       } finally {
         clearTimeout(timeoutId);
       }
     } catch {
-      // Unreachable / timeout / older server without the route → treat as unpinned.
-      return { allowed: true, requiredMinimumVersion: null, requiredMaximumVersion: null };
+      return indeterminate("the endpoint was unreachable or timed out");
     }
 
-    const min = policy.requiredMinimumVersion ?? null;
-    const max = policy.requiredMaximumVersion ?? null;
+    // API responses are enveloped as { success, data } — unwrap if present.
+    // OWN-property membership only: `"data" in json` inherits, which would let
+    // `Object.prototype.data` fabricate a version policy for a body that
+    // carried none. Same helper as request(). (The bounds below were already
+    // read with hasOwnProperty; the unwrap above them was not.)
+    const unwrapped = unwrapApiEnvelope(json);
+    if (unwrapped === null || typeof unwrapped !== "object" || Array.isArray(unwrapped)) {
+      return indeterminate(`the response carried no policy object — shape: ${describeVerdictShape(unwrapped)}`);
+    }
+    const rec = unwrapped as Record<string, unknown>;
+    // Both bounds are ALWAYS present on a real answer: the route builds its
+    // body by spreading the `{requiredMinimumVersion, requiredMaximumVersion}`
+    // default (apps/web/src/app/api/v1/client/policy/route.ts). A body missing
+    // them is a rewritten/error envelope, not "unpinned".
+    // OWN-property reads throughout (audit js-requireverdict-own-properties).
+    // `OWN` is the module-load-captured test — `Object.prototype.hasOwnProperty`
+    // is itself writable, so calling it through the prototype is not a
+    // pollution-proof own-property test.
+    const rawMin = readOwn(rec, "requiredMinimumVersion");
+    const rawMax = readOwn(rec, "requiredMaximumVersion");
+    const hasBounds =
+      OWN(rec, "requiredMinimumVersion") && OWN(rec, "requiredMaximumVersion");
+    const boundOk = (v: unknown) => v === null || typeof v === "string";
+    if (!hasBounds || !boundOk(rawMin) || !boundOk(rawMax)) {
+      return indeterminate(
+        `the response carried no readable version bounds — shape: ${describeVerdictShape(rec)}`,
+      );
+    }
+
+    const min = (rawMin as string | null) ?? null;
+    const max = (rawMax as string | null) ?? null;
     const result: VersionPolicyResult = {
       allowed: true,
       requiredMinimumVersion: min,
       requiredMaximumVersion: max,
     };
-    if (!min && !max) return result; // unpinned
+    if (!min && !max) return result; // unpinned — the default, unchanged
+
+    // Prefer the SERVER's own verdict when it sent one (it always does when a
+    // version is reported, which this method always does). Reusing it keeps the
+    // client from re-deriving — and disagreeing with — `checkClientVersion`.
+    // Own-only: `Object.prototype.versionCheck = { allowed: true }` would
+    // otherwise hand an out-of-range client a server "allowed" verdict the
+    // server never sent, defeating the enterprise version pin.
+    const vc = readOwn(rec, "versionCheck");
+    if (vc && typeof vc === "object" && !Array.isArray(vc)) {
+      const allowed = readOwn(vc, "allowed");
+      const reason = readOwn(vc, "reason");
+      if (typeof allowed === "boolean") {
+        result.allowed = allowed;
+        if (!allowed) {
+          result.reason =
+            typeof reason === "string" && reason
+              ? reason
+              : `@evalguard/sdk ${SDK_VERSION} is outside the version range required by this organization (min=${min ?? "-"}, max=${max ?? "-"}).`;
+        }
+        return result;
+      }
+    }
 
     const ver = parseSemverTuple(SDK_VERSION);
     const minT = parseSemverTuple(min);
     const maxT = parseSemverTuple(max);
-    if (ver && minT && cmpSemver(ver, minT) < 0) {
+    // FAIL CLOSED on an unparseable version while a bound IS set — the same
+    // rule the server's `checkClientVersion` applies ("an org that pins a range
+    // expects every client to prove its version; a client that can't is treated
+    // as out-of-policy"). The old code's `if (ver && minT && …)` guards silently
+    // ALLOWED whenever a bound (e.g. "v2", "1.2") or SDK_VERSION failed to parse.
+    if (!ver || (min && !minT) || (max && !maxT)) {
+      result.allowed = false;
+      result.reason =
+        `This organization pins the client version range (min=${min ?? "-"}, max=${max ?? "-"}), but ` +
+        `the range could not be compared against @evalguard/sdk ${SDK_VERSION} (unparseable semver), ` +
+        `so this client cannot prove it is in policy.`;
+      return result;
+    }
+    if (minT && cmpSemver(ver, minT) < 0) {
       result.allowed = false;
       result.reason = `@evalguard/sdk ${SDK_VERSION} is below the minimum version (${min}) required by this organization. Upgrade to continue.`;
-    } else if (ver && maxT && cmpSemver(ver, maxT) > 0) {
+    } else if (maxT && cmpSemver(ver, maxT) > 0) {
       result.allowed = false;
       result.reason = `@evalguard/sdk ${SDK_VERSION} is above the maximum version (${max}) allowed by this organization. Downgrade to a supported release.`;
     }
@@ -1670,10 +2721,24 @@ export class EvalGuard {
    * Like `checkVersionPolicy()` but THROWS when this SDK version is outside the
    * org's pinned range — call it once at startup to hard-stop an out-of-policy
    * client before it issues any real requests.
+   *
+   * It also throws when the policy could not be READ
+   * ({@link VersionPolicyResult.indeterminate}) — an assertion that passes
+   * because the check never ran is not an assertion. The thrown
+   * {@link EvalGuardError} carries `code: "VERSION_POLICY_INDETERMINATE"` so a
+   * caller that deliberately wants to continue offline can catch exactly that
+   * case; nothing inside this SDK calls `assertVersionAllowed()` implicitly.
    */
   async assertVersionAllowed(): Promise<void> {
     const v = await this.checkVersionPolicy();
-    if (!v.allowed) throw new Error(v.reason ?? "EvalGuard client version not allowed by org policy");
+    if (v.allowed) return;
+    if (v.indeterminate) {
+      throw new EvalGuardError(
+        v.reason ?? "EvalGuard client version policy could not be read",
+        { code: VERSION_POLICY_INDETERMINATE_CODE },
+      );
+    }
+    throw new Error(v.reason ?? "EvalGuard client version not allowed by org policy");
   }
 
   /** Build the consent headers for the bound subject (if any). */
@@ -1709,8 +2774,12 @@ export class EvalGuard {
         { code: "PROJECT_RESOLUTION_FAILED", cause: err },
       );
     }
-    const projectId = data?.projectId;
-    if (!projectId) {
+    // Own-only (audit js-requireverdict-own-properties). This id becomes the
+    // SCOPE of every subsequent check — a firewall/guardrail call scoped to the
+    // wrong project applies the wrong rules — so it must come from the server's
+    // body, not from `Object.prototype.projectId`.
+    const projectId = data && typeof data === "object" ? readOwn(data, "projectId") : undefined;
+    if (!projectId || typeof projectId !== "string") {
       throw new EvalGuardError(
         "Could not resolve a default project; pass projectId explicitly.",
         { code: "PROJECT_RESOLUTION_FAILED" },
@@ -1718,6 +2787,41 @@ export class EvalGuard {
     }
     this.resolvedProjectId = projectId;
     return projectId;
+  }
+
+  /**
+   * Resolve (and cache) the default org for this API key.
+   *
+   * GETs /project/current — which returns RAW `{ projectId, orgId }` (not the
+   * `{ success, data }` envelope) and auto-creates a default project on a fresh
+   * org. The resolved id is cached on the instance so repeated org-scoped calls
+   * never re-fetch. Throws a clear, actionable error when no org can be resolved
+   * so the caller knows to pass `orgId` explicitly.
+   *
+   * Public so callers can pre-warm / inspect the resolved id; org-scoped methods
+   * (e.g. {@link createDataSource}) use it automatically when `orgId` is omitted.
+   */
+  async resolveOrgId(): Promise<string> {
+    if (this.resolvedOrgId) return this.resolvedOrgId;
+    let data: { orgId?: string } | undefined;
+    try {
+      data = await this.request<{ projectId?: string; orgId?: string }>("/project/current", "GET");
+    } catch (err) {
+      throw new EvalGuardError(
+        "Could not resolve a default org; pass orgId explicitly.",
+        { code: "ORG_RESOLUTION_FAILED", cause: err },
+      );
+    }
+    // Own-only — same reasoning as resolveProjectId: this id scopes the checks.
+    const orgId = data && typeof data === "object" ? readOwn(data, "orgId") : undefined;
+    if (!orgId || typeof orgId !== "string") {
+      throw new EvalGuardError(
+        "Could not resolve a default org; pass orgId explicitly.",
+        { code: "ORG_RESOLUTION_FAILED" },
+      );
+    }
+    this.resolvedOrgId = orgId;
+    return orgId;
   }
 
   // ── Governance: intent classification ──────────────────────────────
@@ -1737,7 +2841,9 @@ export class EvalGuard {
     let orgId = opts?.orgId;
     if (!orgId) {
       const data = await this.request<{ orgId?: string }>("/project/current", "GET");
-      orgId = data?.orgId;
+      // Own-only — same reasoning as resolveOrgId.
+      const resolved = data && typeof data === "object" ? readOwn(data, "orgId") : undefined;
+      orgId = typeof resolved === "string" ? resolved : undefined;
       if (!orgId) {
         throw new EvalGuardError(
           "Could not resolve a default org; pass orgId explicitly.",
@@ -1745,11 +2851,24 @@ export class EvalGuard {
         );
       }
     }
-    return this.request("/governance/intent/classify", "POST", {
-      orgId,
-      prompt,
-      sensitivityFloor: opts?.sensitivityFloor,
-    });
+    // FAIL CLOSED: this powers "intent-conditioned policy", so `sensitivity`
+    // is a clearance verdict — `if (c.sensitivity === "restricted") block()`
+    // reads an ABSENT field as "not restricted" and lets the prompt through,
+    // and `riskScore` is thresholded the same way. The wire values are core's
+    // SENSITIVITY_LEVELS ladder (packages/core/src/intent/index.ts:319); a
+    // level outside it is one this client cannot rank.
+    return requireVerdict<IntentClassification>(
+      await this.request("/governance/intent/classify", "POST", {
+        orgId,
+        prompt,
+        sensitivityFloor: opts?.sensitivityFloor,
+      }),
+      "POST /governance/intent/classify",
+      [
+        { path: ["sensitivity"], kind: "enum", values: SENSITIVITY_LEVELS },
+        { path: ["riskScore"], kind: "number" },
+      ],
+    );
   }
 
   /**
@@ -1772,7 +2891,12 @@ export class EvalGuard {
 
   // ── Eval endpoints ─────────────────────────────────────────────────
 
-  async eval(params: EvalParams): Promise<EvalResult> {
+  /**
+   * Start an eval run. POST /evals inserts the run as `running`, fires the
+   * model execution in the BACKGROUND, and returns a started-run STUB
+   * immediately (NOT a finished result). Poll {@link getEvalRun} for the score.
+   */
+  async eval(params: EvalParams): Promise<EvalStartedRun> {
     // Resolve a default project only when none was passed — an explicit
     // projectId is sent verbatim (and skips the /project/current fetch).
     const body = params.projectId
@@ -1781,8 +2905,34 @@ export class EvalGuard {
     return this.request("/evals", "POST", body);
   }
 
-  async getEvalRun(id: string): Promise<EvalRun> {
-    return this.request(`/evals/${id}`, "GET");
+  /**
+   * Fetch an eval run's current state. The endpoint returns
+   * `{ run, results, summary }` and — since the 2026-07 backend fix — ALSO
+   * `status`/`score`/`passRate` FLAT at the top level. This reads the flat
+   * fields when present and otherwise derives them from `run`/`summary`, so the
+   * returned {@link EvalRunDetail} always exposes populated
+   * `status`/`score`/`passRate` regardless of backend version (back-compat).
+   */
+  async getEvalRun(id: string): Promise<EvalRunDetail> {
+    const raw = await this.request<{
+      run?: EvalRun | null;
+      results?: EvalRunCaseResult[];
+      summary?: EvalRunSummary | null;
+      status?: EvalRun["status"] | null;
+      score?: number | null;
+      passRate?: number | null;
+    }>(`/evals/${id}`, "GET");
+
+    const run = raw.run ?? null;
+    const summary = raw.summary ?? null;
+    // Prefer the flat top-level fields (present since the 2026-07 backend fix);
+    // fall back to run.*/summary.* so older servers keep working. `??` (not `||`)
+    // so a legitimate 0 score / "passed" status isn't discarded.
+    const status = raw.status ?? run?.status ?? null;
+    const score = raw.score ?? run?.score ?? summary?.avgScore ?? null;
+    const passRate = raw.passRate ?? summary?.passRate ?? null;
+
+    return { status, score, passRate, run, results: raw.results ?? [], summary };
   }
 
   async listEvals(projectId?: string): Promise<EvalRun[]> {
@@ -1790,7 +2940,14 @@ export class EvalGuard {
     // default project for this key".
     if (projectId !== undefined && !projectId) throw new Error("projectId is required");
     const resolved = projectId ?? (await this.resolveProjectId());
-    return this.request(`/evals?projectId=${encodeURIComponent(resolved)}`, "GET");
+    // GET /evals returns RAW snake_case rows; normalize each to the declared
+    // camelCase EvalRun shape so createdAt/completedAt/projectId/metadata are
+    // populated at runtime (live E2E 2026-07-16 #2).
+    const rows = await this.request<EvalRunWireRow[]>(
+      `/evals?projectId=${encodeURIComponent(resolved)}`,
+      "GET",
+    );
+    return (rows ?? []).map((row) => mapEvalRunRow(row, resolved));
   }
 
   /** Compare two eval runs (regressions / improvements / per-case diff). */
@@ -1806,7 +2963,7 @@ export class EvalGuard {
   }
 
   /**
-   * Start an imperative, Weave-style {@link EvaluationLogger} bound to a new
+   * Start an imperative {@link EvaluationLogger} bound to a new
    * eval run. Use this when your pipeline already produces model outputs and you
    * want to RECORD predictions/scores as you go, instead of handing a full
    * declarative config to `eval()` and letting the server run the model.
@@ -1859,17 +3016,53 @@ export class EvalGuard {
 
   // ── Security scan endpoints ────────────────────────────────────────
 
-  async securityScan(params: SecurityScanParams): Promise<SecurityScanResult> {
+  /**
+   * Start a red-team security scan. POST /security runs the attack probes and
+   * returns a started-scan STUB ({@link SecurityScanStartedRun}) — the id +
+   * summary counts, NOT the per-finding detail. Poll {@link getScan} with the
+   * returned `id` for the {@link SecurityFinding} rows.
+   *
+   *   const scan = await client.securityScan({ model, prompt, attackTypes });
+   *   const result = await client.getScan(scan.id); // findings, passRate, …
+   */
+  async securityScan(params: SecurityScanParams): Promise<SecurityScanStartedRun> {
     // Resolve a default project only when none was passed — an explicit
     // projectId is sent verbatim (and skips the /project/current fetch).
     const body = params.projectId
       ? params
       : { ...params, projectId: await this.resolveProjectId() };
-    return this.request("/security", "POST", body);
+    // FAIL CLOSED on the summary a CI gate reads before it ever polls getScan:
+    // `if (scan.severityCounts.critical > 0) fail()` and
+    // `if (scan.findingsCount === 0) ship()` both read an unreadable 2xx as a
+    // clean red-team result. `totalTests` rides along so a scan that executed
+    // nothing cannot report as a scan that found nothing. (Route:
+    // `apiSuccess({ id, status, score, totalTests, …, findingsCount }, 201)`.)
+    return requireVerdict<SecurityScanStartedRun>(
+      await this.request("/security", "POST", body),
+      "POST /security",
+      [
+        { path: ["findingsCount"], kind: "number" },
+        { path: ["totalTests"], kind: "number" },
+        { path: ["severityCounts", "critical"], kind: "number" },
+      ],
+    );
   }
 
   async getScan(id: string): Promise<SecurityScanResult> {
-    return this.request(`/security/${id}`, "GET");
+    // FAIL CLOSED — identical reasoning to scanSecrets / scanIac, which were
+    // hardened while this one (the red-team scan's OWN result reader) was not.
+    // `(scan.findings ?? []).length === 0` is the documented "did the red-team
+    // find anything" gate, so an ABSENT findings array is a clean bill of
+    // health for a scan whose result never arrived. `totalTests` rides along so
+    // "ran nothing" cannot read as "found nothing".
+    return requireVerdict<SecurityScanResult>(
+      await this.request(`/security/${id}`, "GET"),
+      "GET /security/{scanId}",
+      [
+        { path: ["findings"], kind: "array" },
+        { path: ["totalTests"], kind: "number" },
+      ],
+    );
   }
 
   /**
@@ -2075,7 +3268,23 @@ export class EvalGuard {
       throw new Error("orgId, projectId and configId are required");
     }
     if (!params.content) throw new Error("content is required");
-    return this.request("/gateway/guardrails/shadow/evaluate", "POST", params);
+    // FAIL CLOSED: both verdicts are read as booleans by callers comparing the
+    // enforcing config against the candidate one. An absent `enforcing.blocked`
+    // silently reports "the live config allowed this".
+    return requireVerdict<{
+      divergence: "agree-block" | "agree-allow" | "shadow-stricter" | "shadow-looser";
+      enforcing: { blocked: boolean; category: string | null; latencyMs: number };
+      shadow: { blocked: boolean; category: string | null; latencyMs: number };
+      latencyOverheadMs: number;
+      recorded: boolean;
+    }>(
+      await this.request("/gateway/guardrails/shadow/evaluate", "POST", params),
+      "POST /gateway/guardrails/shadow/evaluate",
+      [
+        { path: ["enforcing", "blocked"], kind: "boolean" },
+        { path: ["shadow", "blocked"], kind: "boolean" },
+      ],
+    );
   }
 
   // ── Supply chain ────────────────────────────────────────────────────
@@ -2231,7 +3440,7 @@ export class EvalGuard {
 
   /**
    * Detect committed secrets (API keys, private keys, cloud/SaaS tokens) in
-   * file contents — gitleaks-style, in-product. Pass a single `content` blob
+   * file contents — signature-based, in-product. Pass a single `content` blob
    * or a `files` array (e.g. a PR's changed files). Findings carry only the
    * REDACTED match (never the raw secret). POST /security/secret-scan.
    *
@@ -2242,7 +3451,19 @@ export class EvalGuard {
     if (!input.content && !(Array.isArray(input.files) && input.files.length > 0)) {
       throw new Error("Provide `content` or a non-empty `files` array");
     }
-    return this.request("/security/secret-scan", "POST", input);
+    // FAIL CLOSED: for a findings-shaped scanner, an ABSENT `findings` array is
+    // indistinguishable from an empty one at the call site
+    // (`(res.findings ?? []).length === 0` → "no secrets"), which is a clean
+    // bill of health for a scan whose result never arrived. `scannedFiles` is
+    // required alongside so "scanned nothing" cannot read as "found nothing".
+    return requireVerdict<SecretScanResult>(
+      await this.request("/security/secret-scan", "POST", input),
+      "POST /security/secret-scan",
+      [
+        { path: ["findings"], kind: "array" },
+        { path: ["scannedFiles"], kind: "number" },
+      ],
+    );
   }
 
   // ── Data quality ───────────────────────────────────────────────────
@@ -2285,12 +3506,26 @@ export class EvalGuard {
 
   // ── Scorers & plugins ──────────────────────────────────────────────
 
+  /**
+   * List every scorer the platform exposes (GET /scorers). The route wraps the
+   * array in `{ scorers, total }`; this unwraps to the bare `Scorer[]` so
+   * callers can `.map`/`for..of` directly — consistent with
+   * {@link listWorkflows}. (Live E2E 2026-07-16 #1: `listScorers()` resolved to
+   * the wrapper object, so `.map` threw.)
+   */
   async listScorers(): Promise<Scorer[]> {
-    return this.request("/scorers", "GET");
+    const res = await this.request<{ scorers: Scorer[] } | Scorer[]>("/scorers", "GET");
+    return Array.isArray(res) ? res : res.scorers;
   }
 
+  /**
+   * List every red-team attack plugin the platform exposes (GET /plugins).
+   * Unwraps the `{ plugins, total }` envelope to the bare `Plugin[]`, matching
+   * {@link listScorers}. (Live E2E 2026-07-16 #1.)
+   */
   async listPlugins(): Promise<Plugin[]> {
-    return this.request("/plugins", "GET");
+    const res = await this.request<{ plugins: Plugin[] } | Plugin[]>("/plugins", "GET");
+    return Array.isArray(res) ? res : res.plugins;
   }
 
   // ── Firewall ───────────────────────────────────────────────────────
@@ -2308,7 +3543,17 @@ export class EvalGuard {
     if (params.projectId) body.projectId = params.projectId;
     if (params.subjectEmail) body.subjectEmail = params.subjectEmail;
     if (params.subjectId) body.subjectId = params.subjectId;
-    return this.request("/firewall/check", "POST", body);
+    // FAIL CLOSED on an unreadable verdict. `blocked` is unconditionally a
+    // boolean on every success path of POST /firewall/check
+    // (apps/web/.../firewall/check/route.ts ends in `apiSuccess({ blocked, … })`),
+    // so a 2xx without it did not come from the firewall. Returning it would
+    // resolve `result.blocked` to `undefined` and every documented caller
+    // (`if (result.blocked) refuse()`) reads that as ALLOW.
+    return requireVerdict<FirewallResult>(
+      await this.request("/firewall/check", "POST", body),
+      "POST /firewall/check",
+      [{ path: ["blocked"], kind: "boolean" }],
+    );
   }
 
   // ── Visual workflows ───────────────────────────────────────────────
@@ -2401,10 +3646,22 @@ export class EvalGuard {
    * ({ action, reasons, latencyMs }).
    */
   async runGuardrails(params: RunGuardrailsParams): Promise<GuardrailsCheckResult> {
-    return this.request("/guardrails", "POST", {
-      text: params.text,
-      ...(params.projectId ? { projectId: params.projectId } : {}),
-    });
+    // FAIL CLOSED on an unreadable verdict — the exact defect shipped in
+    // `evalguardai` 2.1.5 (`_translate` defaulted an absent `action` to
+    // "allow"). POST /guardrails returns core `checkFirewall()`'s
+    // `{ action, reasons, latencyMs }` where action is
+    // "allow" | "block" | "flag" (packages/core/src/security/firewall.ts:35);
+    // "redact" is accepted because this SDK's published `GuardrailsCheckResult`
+    // type has always declared it. An action outside that set is one this
+    // client cannot interpret, so it is refused rather than read as not-block.
+    return requireVerdict<GuardrailsCheckResult>(
+      await this.request("/guardrails", "POST", {
+        text: params.text,
+        ...(params.projectId ? { projectId: params.projectId } : {}),
+      }),
+      "POST /guardrails",
+      [{ path: ["action"], kind: "enum", values: GUARDRAIL_ACTIONS }],
+    );
   }
 
   // ── OpenAI-compatible chat completions ──────────────────────────────
@@ -2648,7 +3905,19 @@ export class EvalGuard {
     const extraHeaders = params.runId
       ? { "x-evalguard-mcp-run-id": params.runId }
       : undefined;
-    return this.request("/mcp/invoke", "POST", body, extraHeaders);
+    // FAIL CLOSED: `decision` is the ONLY field that says whether the
+    // RBAC → CIMD → agent-authz → firewall → rate-limit → quarantine cascade
+    // ran and let this tool call through. It was read straight off the body
+    // while eleven sibling verdict routes on this client were hardened, so a
+    // 2xx that carries no decision (proxy-rewritten 502, `{success:true,
+    // data:null}`, a 200 apiError envelope, a differently-versioned server)
+    // resolved with `decision: undefined` and handed the caller a `response`
+    // no gateway ever authorised.
+    return requireVerdict<McpInvokeResult>(
+      await this.request("/mcp/invoke", "POST", body, extraHeaders),
+      "POST /mcp/invoke",
+      [{ path: ["decision"], kind: "enum", values: MCP_INVOKE_DECISIONS }],
+    );
   }
 
   // ── Benchmarks ─────────────────────────────────────────────────────
@@ -2786,7 +4055,8 @@ export class EvalGuard {
   }
 
   async getSecurityReport(scanId: string): Promise<unknown> {
-    return this.request(`/security/report?scanId=${encodeURIComponent(scanId)}`, "GET");
+    // Route reads `assessmentId` (see api/v1/security/report/route.ts GET).
+    return this.request(`/security/report?assessmentId=${encodeURIComponent(scanId)}`, "GET");
   }
 
   // ── Support ───────────────────────────────────────────────────────
@@ -2865,12 +4135,256 @@ export class EvalGuard {
 
   // ── Prompts ───────────────────────────────────────────────────────
 
-  async createPrompt(params: { projectId: string; name: string; content: string; model?: string; tags?: string[] }): Promise<unknown> {
+  /**
+   * Create a prompt version. Backward-compatible: an opaque `content` string
+   * plus optional `model`/`tags` still works exactly as before. To register a
+   * fully **typed** prompt artifact, additionally pass:
+   *   - `config`: the typed {@link PromptConfig} (model + decoding + tools),
+   *   - `template`: a completion string or role-tagged {@link PromptTemplate},
+   *   - `templateLanguage`: `"default"` | `"jinja"`.
+   *
+   * When `config` is supplied it is validated client-side via
+   * `validatePromptConfig` before any network call, so a malformed config
+   * throws a typed {@link EvalGuardError} (`code: "INVALID_PROMPT_CONFIG"`)
+   * instead of a late server 400.
+   */
+  async createPrompt(params: {
+    projectId: string;
+    name: string;
+    content: string;
+    model?: string;
+    tags?: string[];
+    config?: PromptConfig;
+    template?: PromptTemplate;
+    templateLanguage?: TemplateLanguage;
+  }): Promise<unknown> {
+    if (params.config !== undefined) {
+      const { valid, errors } = validatePromptConfig(params.config);
+      if (!valid) {
+        throw new EvalGuardError(`Invalid prompt config: ${errors.join("; ")}`, {
+          code: "INVALID_PROMPT_CONFIG",
+        });
+      }
+    }
     return this.request("/prompts", "POST", params);
   }
 
   async listPrompts(projectId: string): Promise<unknown> {
     return this.request(`/prompts?projectId=${encodeURIComponent(projectId)}`, "GET");
+  }
+
+  // ── Environments (Phase 2) ────────────────────────────────────────
+  //
+  // Arbitrary NAMED deployment environments replace the old hardcoded
+  // staging/production pair. `staging` + `production` are seeded server-side
+  // so existing deploy calls keep working. Each environment carries an
+  // { id, name, tag } shape.
+
+  /**
+   * List every named environment in the workspace. Each entry carries its
+   * `tag` (`default` marks the fallback environment).
+   */
+  async listEnvironments(projectId: string): Promise<unknown> {
+    return this.request(`/environments?projectId=${encodeURIComponent(projectId)}`, "GET");
+  }
+
+  /**
+   * Create a named environment. `tag` defaults to `"other"`; at most one
+   * environment may carry `"default"` (the fallback used when a call names no
+   * environment).
+   */
+  async createEnvironment(params: {
+    projectId: string;
+    name: string;
+    tag?: EnvironmentTag;
+  }): Promise<unknown> {
+    if (!params.name || !params.name.trim()) {
+      throw new EvalGuardError("Environment name is required", {
+        code: "INVALID_ENVIRONMENT",
+      });
+    }
+    return this.request("/environments", "POST", params);
+  }
+
+  /** Remove a named environment. Deployments targeting it should be removed first. */
+  async removeEnvironment(projectId: string, name: string): Promise<unknown> {
+    // Flat route: DELETE /environments?name= (the org is resolved from auth).
+    return this.request(`/environments?name=${encodeURIComponent(name)}`, "DELETE");
+  }
+
+  // ── Prompt deployment to named environments (Phase 2) ─────────────
+  //
+  // Set / remove / list the deployed prompt version per named
+  // environment. `environment` is any registered environment name.
+
+  /**
+   * Set the deployed prompt version for the specified environment. This is the
+   * version used for calls made in that environment. Argument order is
+   * (`name`, `environment`, `version`).
+   */
+  async setPromptDeployment(params: {
+    projectId: string;
+    name: string;
+    environment: string;
+    version: number;
+  }): Promise<unknown> {
+    // Flat route: POST /prompts/deployments — body { name, version, env }.
+    return this.request("/prompts/deployments", "POST", {
+      name: params.name,
+      version: params.version,
+      env: params.environment,
+    });
+  }
+
+  /**
+   * @deprecated Unsupported. The prompt deployments API exposes no DELETE
+   * route — there is no way to un-deploy a prompt version from an environment.
+   * Deploy a different version with {@link setPromptDeployment}, or roll back
+   * via the deployments `PUT` action (`action: "rollback"`).
+   */
+  async removePromptDeployment(_params: {
+    projectId: string;
+    name: string;
+    environment: string;
+  }): Promise<unknown> {
+    throw new EvalGuardError(
+      "removePromptDeployment is not supported: the prompt deployments API has no DELETE route. " +
+        "Deploy a different version with setPromptDeployment, or roll back via the deployments PUT action.",
+      { code: "UNSUPPORTED_OPERATION" },
+    );
+  }
+
+  /** List all environments and the prompt version deployed to each. */
+  async listPromptEnvironments(projectId: string, name: string): Promise<unknown> {
+    // Flat route: GET /prompts/deployments?name= (returns current + history).
+    return this.request(`/prompts/deployments?name=${encodeURIComponent(name)}`, "GET");
+  }
+
+  // ── Tools (Phase 2) ───────────────────────────────────────────────
+  //
+  // Managed, versioned Tools deployed to named environments. A Tool
+  // version's identity is a `ToolConfig` (function spec REUSED from the
+  // prompt config, source code, setup schema). The config is validated
+  // client-side via `validateToolConfig` before any network call, exactly
+  // as `createPrompt` validates a `PromptConfig`.
+
+  /**
+   * Create (or upsert a new version of) a managed Tool. `config` is validated
+   * client-side; a malformed config throws a typed {@link EvalGuardError}
+   * (`code: "INVALID_TOOL_CONFIG"`) instead of a late server 400.
+   */
+  async createTool(params: {
+    projectId: string;
+    name: string;
+    config: ToolConfig;
+  }): Promise<unknown> {
+    const { valid, errors } = validateToolConfig(params.config);
+    if (!valid) {
+      throw new EvalGuardError(`Invalid tool config: ${errors.join("; ")}`, {
+        code: "INVALID_TOOL_CONFIG",
+      });
+    }
+    return this.request("/tools", "POST", params);
+  }
+
+  /** Get a Tool (latest version, or a specific `version` when supplied). */
+  async getTool(projectId: string, name: string, version?: number): Promise<unknown> {
+    // Flat route: GET /tools?name=&version= (a specific version returns one record).
+    const q =
+      `?name=${encodeURIComponent(name)}` +
+      (version !== undefined ? `&version=${version}` : "");
+    return this.request(`/tools${q}`, "GET");
+  }
+
+  /** List all managed Tools in the workspace. */
+  async listTools(projectId: string): Promise<unknown> {
+    return this.request(`/tools?projectId=${encodeURIComponent(projectId)}`, "GET");
+  }
+
+  /** List every version of a Tool, ascending by version number. */
+  async listToolVersions(projectId: string, name: string): Promise<unknown> {
+    // Flat route: GET /tools?name= returns all versions of that tool.
+    return this.request(`/tools?name=${encodeURIComponent(name)}`, "GET");
+  }
+
+  /**
+   * Set the deployed Tool version for the specified environment — the version
+   * used for calls made in that environment.
+   */
+  async setToolDeployment(params: {
+    projectId: string;
+    name: string;
+    environment: string;
+    version: number;
+  }): Promise<unknown> {
+    // Flat route: POST /tools/deployments — body { toolName, version, env }.
+    return this.request("/tools/deployments", "POST", {
+      toolName: params.name,
+      version: params.version,
+      env: params.environment,
+    });
+  }
+
+  /**
+   * Remove the deployed Tool version from the specified environment. The
+   * environment itself remains registered.
+   */
+  async removeToolDeployment(params: {
+    projectId: string;
+    name: string;
+    environment: string;
+  }): Promise<unknown> {
+    // Flat route: DELETE /tools/deployments?name=&env=.
+    const q =
+      `?name=${encodeURIComponent(params.name)}` +
+      `&env=${encodeURIComponent(params.environment)}`;
+    return this.request(`/tools/deployments${q}`, "DELETE");
+  }
+
+  /** List all environments and the Tool version deployed to each. */
+  async listToolEnvironments(projectId: string, name: string): Promise<unknown> {
+    // Flat route: GET /tools/deployments?name= (returns environments + history).
+    return this.request(`/tools/deployments?name=${encodeURIComponent(name)}`, "GET");
+  }
+
+  // ── Tool environment variables (Phase 2) ──────────────────────────
+  // Get / add / delete a Tool's environment variables.
+
+  /** List a Tool's environment variables. */
+  async getToolEnvironmentVariables(projectId: string, name: string): Promise<unknown> {
+    // Flat route: GET /tools/env-vars?name=.
+    return this.request(`/tools/env-vars?name=${encodeURIComponent(name)}`, "GET");
+  }
+
+  /** Add (or overwrite) an environment variable on a Tool. */
+  async addToolEnvironmentVariable(params: {
+    projectId: string;
+    name: string;
+    variable: ToolEnvironmentVariable;
+  }): Promise<unknown> {
+    if (!params.variable.name || !params.variable.name.trim()) {
+      throw new EvalGuardError("Environment variable name is required", {
+        code: "INVALID_TOOL_ENV_VAR",
+      });
+    }
+    // Flat route: POST /tools/env-vars — body { name, variables: [{ name, value }] }.
+    return this.request("/tools/env-vars", "POST", {
+      name: params.name,
+      variables: [params.variable],
+    });
+  }
+
+  /** Delete an environment variable from a Tool by name. */
+  async deleteToolEnvironmentVariable(
+    projectId: string,
+    name: string,
+    variableName: string,
+  ): Promise<unknown> {
+    // Flat route: DELETE /tools/env-vars?name=&varName=.
+    const q =
+      `?name=${encodeURIComponent(name)}` +
+      `&varName=${encodeURIComponent(variableName)}`;
+    return this.request(`/tools/env-vars${q}`, "DELETE");
   }
 
   // ── Datasets ──────────────────────────────────────────────────────
@@ -2985,7 +4499,7 @@ export class EvalGuard {
 
   // ── Evaluator Hub (versioned, reusable evaluator registry) ────────
   //
-  // Arize-parity registry: one row per (project, name, version), content-hash
+  // Content-hash registry: one row per (project, name, version), content-hash
   // deduped. Mirrors the CLI (`evalguard evaluators list|diff`) + the
   // /api/v1/evaluators routes. Loose `unknown` return — callers cast into their
   // own DTO; the JSON shape is documented in the OpenAPI spec.
@@ -3026,8 +4540,8 @@ export class EvalGuard {
   // ── Scorer calibration (CLHF — continuous learning from human feedback) ──
   //
   // Quantifies evaluator/human agreement (chance-corrected Cohen's kappa) and
-  // recommends the score threshold that maximizes agreement. Galileo/Patronus
-  // parity. Supply `pairs` (human/machine labels) and/or `scored`
+  // recommends the score threshold that maximizes agreement. Supply `pairs`
+  // (human/machine labels) and/or `scored`
   // (humanPass + machineScore).
 
   async calibrateScorer(params: {
@@ -3743,10 +5257,15 @@ export class EvalGuard {
     return this.request(`/privacy/dsr/${encodeURIComponent(id)}`, "GET");
   }
   async searchDSR(id: string): Promise<{ found: number; summary: Record<string, number>; next: string }> {
-    return this.request(`/privacy/dsr/${encodeURIComponent(id)}/search`, "POST");
+    // Send an empty JSON object, not a bare no-body POST: request() always sets
+    // `Content-Type: application/json`, and the route rejects an empty body with
+    // 400 "Invalid JSON body" (audit 2026-07-15 #5). Mirrors snapshotDataset/
+    // startDataScan, which already send `{}`.
+    return this.request(`/privacy/dsr/${encodeURIComponent(id)}/search`, "POST", {});
   }
   async exportDSR(id: string): Promise<unknown> {
-    return this.request(`/privacy/dsr/${encodeURIComponent(id)}/export`, "POST");
+    // Empty JSON body (see searchDSR) — a no-body POST 400s "Invalid JSON body".
+    return this.request(`/privacy/dsr/${encodeURIComponent(id)}/export`, "POST", {});
   }
   async updateDSR(id: string, patch: { status?: string; notes?: string; rejected_reason?: string }): Promise<unknown> {
     return this.request(`/privacy/dsr/${encodeURIComponent(id)}`, "PATCH", patch);
@@ -3764,7 +5283,8 @@ export class EvalGuard {
     return this.request("/privacy/consent", "POST", params);
   }
   async revokeConsent(id: string): Promise<unknown> {
-    return this.request(`/privacy/consent?id=${encodeURIComponent(id)}`, "PATCH");
+    // Empty JSON body (see searchDSR) — a no-body PATCH 400s "Invalid JSON body".
+    return this.request(`/privacy/consent?id=${encodeURIComponent(id)}`, "PATCH", {});
   }
 
   async listProcessingActivities(): Promise<unknown[]> {
@@ -3823,8 +5343,12 @@ export class EvalGuard {
   async listDataSources(): Promise<unknown[]> {
     return this.request("/data-discovery/sources", "GET");
   }
-  async createDataSource(params: { name: string; connector_type: "s3" | "snowflake" | "http" | string; config: Record<string, unknown>; classifier_mode?: "dlp_only" | "dlp_plus_llm" | "llm_only"; vault_entry_id?: string; }): Promise<unknown> {
-    return this.request("/data-discovery/sources", "POST", params);
+  async createDataSource(params: { orgId?: string; projectId?: string; name: string; connector_type: "s3" | "snowflake" | "http" | string; config: Record<string, unknown>; classifier_mode?: "dlp_only" | "dlp_plus_llm" | "llm_only"; vault_entry_id?: string; }): Promise<unknown> {
+    // The POST route REQUIRES orgId (it runs the admin-role membership gate off
+    // body.orgId); omitting it 400s (audit 2026-07-15 #4). Resolve the key's
+    // default org when the caller doesn't pass one.
+    const orgId = params.orgId ?? (await this.resolveOrgId());
+    return this.request("/data-discovery/sources", "POST", { ...params, orgId });
   }
   async startDataScan(sourceId: string): Promise<unknown> {
     return this.request(`/data-discovery/sources/${encodeURIComponent(sourceId)}/scan`, "POST", {});
@@ -4025,7 +5549,20 @@ export class EvalGuard {
    */
   async getDecisionBOM(id: string): Promise<DecisionBOMResponse> {
     if (!id) throw new Error("getDecisionBOM: id is required");
-    return this.request(`/compliance/decision-bom/${encodeURIComponent(id)}`, "GET");
+    // FAIL CLOSED: `verification.valid` IS the verdict — it is the server's
+    // re-check of the Ed25519 signature over a tamper-evident compliance
+    // record, and `verdict` is what the record attests. A 2xx that carries
+    // neither (proxy-rewritten body, differently-versioned server) would let
+    // `bom.verification?.valid` read as `undefined` while an auditor's UI
+    // renders the (equally unverified) `bom` payload as a signed decision.
+    return requireVerdict<DecisionBOMResponse>(
+      await this.request(`/compliance/decision-bom/${encodeURIComponent(id)}`, "GET"),
+      "GET /compliance/decision-bom/{id}",
+      // Only `verification.valid` is asserted: the row's `verdict` is a
+      // free-form string column (route: `verdict: row.verdict`), so an enum
+      // over it would refuse legitimate records.
+      [{ path: ["verification", "valid"], kind: "boolean" }],
+    );
   }
 
   // ── FinOps cost export (FOCUS / OpenMeter / Lago interchange) ─────
@@ -4087,14 +5624,34 @@ export class EvalGuard {
     );
   }
 
-  /** Update an agent tool (partial — pass only the fields to change). PATCH /agent-tools/{id}. */
+  /**
+   * Update an agent tool (partial — pass only the fields to change).
+   * PATCH /agent-tools/{id}.
+   *
+   * The PATCH route REPLACES the definition and re-runs `validateToolDefinition`
+   * (which requires a full, valid `name` + `parameters` + type-specific config),
+   * so sending a bare partial 400s (audit 2026-07-15). To make the "partial"
+   * contract actually work, this fetches the current tool, shallow-merges the
+   * caller's changes over it, and sends the FULL merged object. The server
+   * preserves the stored secret when `rest.auth.value` isn't re-sent, so the
+   * fetched tool (secret redacted) round-trips safely. Nested objects
+   * (`rest`/`code`/`mcp`/`parameters`) are replaced wholesale when provided.
+   */
   async updateAgentTool(
     id: string,
     params: { projectId: string; tool: Partial<AgentTool> },
   ): Promise<AgentTool> {
     if (!id) throw new Error("updateAgentTool: id is required");
     if (!params.projectId) throw new Error("updateAgentTool: projectId is required");
-    return this.request(`/agent-tools/${encodeURIComponent(id)}`, "PATCH", params);
+    if (!params.tool || typeof params.tool !== "object") {
+      throw new Error("updateAgentTool: tool is required");
+    }
+    const current = await this.getAgentTool(id, params.projectId);
+    const merged: AgentTool = { ...current, ...params.tool };
+    return this.request(`/agent-tools/${encodeURIComponent(id)}`, "PATCH", {
+      projectId: params.projectId,
+      tool: merged,
+    });
   }
 
   /** Delete an agent tool. DELETE /agent-tools/{id}. */
@@ -4299,7 +5856,16 @@ export class EvalGuard {
   }): Promise<{ probability: number; model?: string; scores?: { label: string; score: number }[] }> {
     if (!params.projectId) throw new Error("scoreVoiceDeepfake: projectId is required");
     if (!params.audioBase64) throw new Error("scoreVoiceDeepfake: audioBase64 is required");
-    return this.request("/voice/deepfake-score", "POST", params);
+    // FAIL CLOSED — the audio sibling of detectDeepfake (whose `synthetic`
+    // boolean IS validated). Here the verdict is the number the caller
+    // thresholds: `if (r.probability > 0.8) reject()`. An absent probability
+    // makes `undefined > 0.8` false, so an unreadable 2xx admits the voice as
+    // genuine. A THRESHOLDED verdict fails open exactly like a boolean one.
+    return requireVerdict<{ probability: number; model?: string; scores?: { label: string; score: number }[] }>(
+      await this.request("/voice/deepfake-score", "POST", params),
+      "POST /voice/deepfake-score",
+      [{ path: ["probability"], kind: "number" }],
+    );
   }
 
   // ── Vision moderation (BYO vision model) ──────────────────────────
@@ -4331,7 +5897,15 @@ export class EvalGuard {
     if (!params.imageUrl && !params.imageBase64) {
       throw new Error("moderateImage: imageUrl or imageBase64 is required");
     }
-    return this.request("/moderation/image", "POST", params);
+    // FAIL CLOSED. The ROUTE fails closed (flagged) on a backend error, but
+    // that guarantee only holds for bodies the route actually produced; a
+    // rewritten 200 from a proxy has no `flagged` at all and `if (r.flagged)`
+    // reads it as safe.
+    return requireVerdict(
+      await this.request("/moderation/image", "POST", params),
+      "POST /moderation/image",
+      [{ path: ["flagged"], kind: "boolean" }],
+    );
   }
 
   /** Moderate a video by sampling caller-supplied frames through the project's
@@ -4361,7 +5935,16 @@ export class EvalGuard {
     if (!params.orgId) throw new Error("moderateVideo: orgId is required");
     if (!params.projectId) throw new Error("moderateVideo: projectId is required");
     if (!params.frames || params.frames.length === 0) throw new Error("moderateVideo: at least one frame is required");
-    return this.request("/moderation/video", "POST", params);
+    // FAIL CLOSED — see moderateImage. `framesEvaluated` is required too: a
+    // clip verdict computed over zero frames is not a clean clip.
+    return requireVerdict(
+      await this.request("/moderation/video", "POST", params),
+      "POST /moderation/video",
+      [
+        { path: ["flagged"], kind: "boolean" },
+        { path: ["framesEvaluated"], kind: "number" },
+      ],
+    );
   }
 
   /** Detect a visual deepfake / synthetic media (image or video) via the
@@ -4392,7 +5975,20 @@ export class EvalGuard {
     if (!params.imageUrl && !params.imageBase64 && !(params.frames && params.frames.length > 0)) {
       throw new Error("detectDeepfake: provide imageUrl/imageBase64 (image) or frames[] (video)");
     }
-    return this.request("/moderation/deepfake", "POST", params);
+    // FAIL CLOSED. The route's documented "fails CLOSED (synthetic) on detector
+    // error" contract is a SERVER guarantee; it says nothing about a body the
+    // server never wrote. `if (r.synthetic)` on an absent field reads authentic.
+    return requireVerdict<{
+      kind: "image" | "video";
+      synthetic: boolean;
+      probability: number;
+      label?: string;
+      [k: string]: unknown;
+    }>(
+      await this.request("/moderation/deepfake", "POST", params),
+      "POST /moderation/deepfake",
+      [{ path: ["synthetic"], kind: "boolean" }],
+    );
   }
 
   // ── Language detection (text → language) ──────────────────────────
@@ -4432,7 +6028,26 @@ export class EvalGuard {
   }> {
     if (!params.projectId) throw new Error("auditMcpServer: projectId is required");
     if (!params.server) throw new Error("auditMcpServer: server is required");
-    return this.request("/security/mcp-predeployment-audit", "POST", { ...params, tools: params.tools ?? [] });
+    // FAIL CLOSED: this verdict gates a pre-deploy approval. An absent
+    // `verdict` makes `verdict === "block"` false — the server is approved on a
+    // body that never carried an approval. `findings` is required too so an
+    // empty audit cannot be read as a clean one.
+    return requireVerdict<{
+      server: { id: string; name?: string; url?: string };
+      toolCount: number;
+      findings: Array<{ severity: string; category: string; target: string; title: string; detail: string; remediation: string }>;
+      summary: { critical: number; high: number; medium: number; low: number; total: number };
+      riskScore: number;
+      verdict: "block" | "review" | "pass";
+      attestation: { signedOff: boolean; signedBy?: string; signedAt?: string; note?: string };
+    }>(
+      await this.request("/security/mcp-predeployment-audit", "POST", { ...params, tools: params.tools ?? [] }),
+      "POST /security/mcp-predeployment-audit",
+      [
+        { path: ["verdict"], kind: "enum", values: ["block", "review", "pass"] },
+        { path: ["findings"], kind: "array" },
+      ],
+    );
   }
 
   /** Run an execution-layer red-team against a target agent: drive it with
@@ -4456,14 +6071,31 @@ export class EvalGuard {
   }> {
     if (!params.projectId) throw new Error("runAgentExecRedTeam: projectId is required");
     if (!params.targetProvider || !params.targetModel) throw new Error("runAgentExecRedTeam: targetProvider and targetModel are required");
-    return this.request("/security/agent-exec-redteam", "POST", {
-      projectId: params.projectId,
-      target_provider: params.targetProvider,
-      target_model: params.targetModel,
-      system_prompt: params.systemPrompt,
-      attack_prompts: params.attackPrompts,
-      tools: params.tools,
-    });
+    // FAIL CLOSED: `verdict` is what a CI gate branches on. Absent → not
+    // "breached" → the pipeline reports the agent safe against attacks that
+    // were never run.
+    return requireVerdict<{
+      totalAttacks: number;
+      dangerousAttempts: number;
+      breaches: number;
+      verdict: "breached" | "attempted" | "safe";
+      attacks: Array<{ prompt: string; response: string; attemptedDangerous: boolean; breached: boolean; toolCalls: unknown[] }>;
+      tools: string[];
+    }>(
+      await this.request("/security/agent-exec-redteam", "POST", {
+        projectId: params.projectId,
+        target_provider: params.targetProvider,
+        target_model: params.targetModel,
+        system_prompt: params.systemPrompt,
+        attack_prompts: params.attackPrompts,
+        tools: params.tools,
+      }),
+      "POST /security/agent-exec-redteam",
+      [
+        { path: ["verdict"], kind: "enum", values: ["breached", "attempted", "safe"] },
+        { path: ["totalAttacks"], kind: "number" },
+      ],
+    );
   }
 
   // ── Observability (agent-to-agent communication graph) ────────────
@@ -4535,7 +6167,148 @@ export class EvalGuard {
   }): Promise<{ policyId: string; policyName: string; decision: DataBoundaryEvalDecision }> {
     if (!params.orgId) throw new Error("evaluateDataBoundary: orgId is required");
     if (!params.boundary) throw new Error("evaluateDataBoundary: boundary is required");
-    return this.request("/data-boundary/evaluate", "POST", params);
+    // FAIL CLOSED: `decision.allow` is the allow/deny for a boundary crossing.
+    // Absent → `decision?.allow` is `undefined` → falsy → the caller lets
+    // restricted content cross.
+    return requireVerdict<{
+      policyId: string;
+      policyName: string;
+      decision: DataBoundaryEvalDecision;
+    }>(
+      await this.request("/data-boundary/evaluate", "POST", params),
+      "POST /data-boundary/evaluate",
+      [{ path: ["decision", "allow"], kind: "boolean" }],
+    );
+  }
+
+  // ── Agent memory-governance policy (Wave 3) ────────────────────────
+  // Admin-managed policy governing durable agent-memory writes for an org (or a
+  // project scope): mode off/monitor/enforce + config knobs (poisoning-screen
+  // confidence threshold, HITL-on-rewrite, provenance-required). CRUD over
+  // /agent-memory/governance. Admin role required (same gate as the route).
+
+  /** Read the org's memory-governance policy (null when none set). Pass
+   *  `projectId` to read a project-scoped policy instead of the org-wide one.
+   *  GET /agent-memory/governance?orgId=[&projectId=]. */
+  async getMemoryGovernancePolicy(params: {
+    orgId: string;
+    projectId?: string | null;
+  }): Promise<{ policy: MemoryGovernancePolicyRecord | null }> {
+    if (!params.orgId) throw new Error("getMemoryGovernancePolicy: orgId is required");
+    const q = new URLSearchParams({ orgId: params.orgId });
+    if (params.projectId) q.set("projectId", params.projectId);
+    return this.request(`/agent-memory/governance?${q.toString()}`, "GET");
+  }
+
+  /** Create or update the org(+project) memory-governance policy. Admin only.
+   *  PUT /agent-memory/governance. */
+  async setMemoryGovernancePolicy(params: {
+    orgId: string;
+    projectId?: string | null;
+    enabled?: boolean;
+    mode?: MemoryGovernanceMode;
+    config?: Partial<MemoryGovernanceConfig>;
+  }): Promise<{ policy: MemoryGovernancePolicyRecord }> {
+    if (!params.orgId) throw new Error("setMemoryGovernancePolicy: orgId is required");
+    return this.request("/agent-memory/governance", "PUT", params);
+  }
+
+  /** Delete the org(+project) memory-governance policy (reverts to no
+   *  governance). Admin only. DELETE /agent-memory/governance?orgId=[&projectId=]. */
+  async deleteMemoryGovernancePolicy(params: {
+    orgId: string;
+    projectId?: string | null;
+  }): Promise<{ deleted: boolean }> {
+    if (!params.orgId) throw new Error("deleteMemoryGovernancePolicy: orgId is required");
+    const q = new URLSearchParams({ orgId: params.orgId });
+    if (params.projectId) q.set("projectId", params.projectId);
+    return this.request(`/agent-memory/governance?${q.toString()}`, "DELETE");
+  }
+
+  // ── Gateway guardrail config (Wave 2) ──────────────────────────────
+  // Per-project, opt-in inline guardrails the gateway proxy wires into the hot
+  // path: partner-vendor adapters (aporia / lakera / …, each keyed by a stored
+  // provider_keys secretRef) and the dependency-free local presets
+  // (local-firewall / moderated-firewall + the Wave-2 agent guardrails
+  // data-not-instructions / tool-call-circuit-breaker, which carry NO secretRef).
+  // CRUD over /gateway/guardrails. Admin role required (same gate as the route).
+
+  /** List a project's guardrail-config rows (ordered by priority). Returns the
+   *  rows normalized to the camelCase {@link GuardrailConfigRecord} shape (the
+   *  route projects raw snake_case DB columns). GET
+   *  /gateway/guardrails?projectId=…. */
+  async listGuardrailConfigs(projectId: string): Promise<GuardrailConfigRecord[]> {
+    if (!projectId) throw new Error("listGuardrailConfigs: projectId is required");
+    const rows = await this.request<GuardrailConfigWireRow[]>(
+      `/gateway/guardrails?projectId=${encodeURIComponent(projectId)}`,
+      "GET",
+    );
+    return (rows ?? []).map(mapGuardrailConfigRow);
+  }
+
+  /** Create or update a project's guardrail-config row (idempotent on
+   *  (projectId, vendor)). Admin only. POST /gateway/guardrails.
+   *
+   *  Models the local-vs-vendor secretRef rule client-side so a bad config fails
+   *  fast instead of round-tripping to a 400: a {@link LocalGuardrailVendor}
+   *  (incl. the Wave-2 `data-not-instructions` / `tool-call-circuit-breaker`)
+   *  makes no external call and MUST NOT carry a `secretRef`, while every other
+   *  vendor REQUIRES one. */
+  async upsertGuardrailConfig(params: UpsertGuardrailConfigParams): Promise<GuardrailConfigRecord> {
+    if (!params.orgId) throw new Error("upsertGuardrailConfig: orgId is required");
+    if (!params.projectId) throw new Error("upsertGuardrailConfig: projectId is required");
+    if (!params.vendor) throw new Error("upsertGuardrailConfig: vendor is required");
+
+    const local = isLocalGuardrailVendor(params.vendor);
+    const hasSecretRef = params.secretRef != null;
+    if (local && hasSecretRef) {
+      throw new Error(
+        `upsertGuardrailConfig: local guardrail '${params.vendor}' makes no external call and must not carry a secretRef`,
+      );
+    }
+    if (!local && !hasSecretRef) {
+      throw new Error(
+        `upsertGuardrailConfig: vendor guardrail '${params.vendor}' requires a secretRef pointing at a stored provider key`,
+      );
+    }
+    if (params.vendorChain && params.vendorChain.length > 0 && params.vendorChain[0] !== params.vendor) {
+      throw new Error(
+        `upsertGuardrailConfig: vendorChain[0] ('${params.vendorChain[0]}') must equal vendor ('${params.vendor}') — the primary`,
+      );
+    }
+
+    // Never send a secretRef for a local preset even if the caller passed null —
+    // the route rejects the key being present at all for locals.
+    const body: Record<string, unknown> = {
+      orgId: params.orgId,
+      projectId: params.projectId,
+      vendor: params.vendor,
+    };
+    if (params.config !== undefined) body.config = params.config;
+    if (params.vendorChain !== undefined) body.vendorChain = params.vendorChain;
+    if (params.fallbackOnErrors !== undefined) body.fallbackOnErrors = params.fallbackOnErrors;
+    if (!local && hasSecretRef) body.secretRef = params.secretRef;
+    if (params.onFlag !== undefined) body.onFlag = params.onFlag;
+    if (params.checkRequest !== undefined) body.checkRequest = params.checkRequest;
+    if (params.checkResponse !== undefined) body.checkResponse = params.checkResponse;
+    if (params.tokenizePii !== undefined) body.tokenizePii = params.tokenizePii;
+    if (params.enabled !== undefined) body.enabled = params.enabled;
+    if (params.priority !== undefined) body.priority = params.priority;
+
+    const row = await this.request<GuardrailConfigWireRow>("/gateway/guardrails", "POST", body);
+    return mapGuardrailConfigRow(row);
+  }
+
+  /** Delete a project's guardrail-config row by id. Admin only. DELETE
+   *  /gateway/guardrails?projectId=…&id=…. */
+  async deleteGuardrailConfig(params: {
+    projectId: string;
+    id: string;
+  }): Promise<{ deleted: string }> {
+    if (!params.projectId) throw new Error("deleteGuardrailConfig: projectId is required");
+    if (!params.id) throw new Error("deleteGuardrailConfig: id is required");
+    const q = new URLSearchParams({ projectId: params.projectId, id: params.id });
+    return this.request(`/gateway/guardrails?${q.toString()}`, "DELETE");
   }
 
   // ── AI-infra IaC / manifest static scan (G8) ──────────────────────
@@ -4564,7 +6337,119 @@ export class EvalGuard {
     if (!params.files || params.files.length === 0) {
       throw new Error("scanIac: at least one file is required");
     }
-    return this.request("/security/iac-scan", "POST", { files: params.files });
+    // FAIL CLOSED — same reasoning as scanSecrets: an absent `findings` array
+    // reads as "no misconfigurations" at every call site.
+    return requireVerdict<{
+      scannedFiles: number;
+      findingsCount: number;
+      bySeverity: { critical: number; high: number; medium: number; low: number };
+      findings: Array<{
+        ruleId: string;
+        severity: "critical" | "high" | "medium" | "low";
+        file: string;
+        line: number;
+        title: string;
+        recommendation: string;
+      }>;
+    }>(
+      await this.request("/security/iac-scan", "POST", { files: params.files }),
+      "POST /security/iac-scan",
+      [
+        { path: ["findings"], kind: "array" },
+        { path: ["scannedFiles"], kind: "number" },
+      ],
+    );
+  }
+
+  // ── Online evaluations (production sampling) ───────────────────────
+
+  /**
+   * Read the online-eval summary for a project: configured samplers, the most
+   * recent scored results over a window, and per-scorer aggregates (pass rate,
+   * error rate, p95 duration). GET /online-evals?projectId=
+   */
+  async listOnlineEvals(
+    projectId: string,
+    opts?: { since?: string; resultsLimit?: number },
+  ): Promise<OnlineEvalsSummary> {
+    if (!projectId) throw new Error("projectId is required");
+    const q = new URLSearchParams({ projectId });
+    if (opts?.since) q.set("since", opts.since);
+    if (typeof opts?.resultsLimit === "number") q.set("resultsLimit", String(opts.resultsLimit));
+    return this.request(`/online-evals?${q.toString()}`, "GET");
+  }
+
+  /**
+   * List every online-eval sampler across the projects in an org. Owner/admin.
+   * GET /online-eval-samplers?orgId=
+   */
+  async listOnlineEvalSamplers(
+    orgId: string,
+  ): Promise<{ samplers: OnlineEvalSampler[]; count: number }> {
+    if (!orgId) throw new Error("orgId is required");
+    return this.request(`/online-eval-samplers?orgId=${encodeURIComponent(orgId)}`, "GET");
+  }
+
+  /**
+   * Fetch a single online-eval sampler by id. GET /online-eval-samplers/:id
+   */
+  async getOnlineEvalSampler(id: string): Promise<{ sampler: OnlineEvalSampler }> {
+    if (!id) throw new Error("id is required");
+    return this.request(`/online-eval-samplers/${encodeURIComponent(id)}`, "GET");
+  }
+
+  /**
+   * Create an online-eval sampler that scores a sampled % of live traffic for a
+   * project. Owner/admin only. POST /online-eval-samplers
+   */
+  async createOnlineEvalSampler(
+    input: CreateOnlineEvalSamplerInput,
+  ): Promise<{ ok: boolean; id: string; name: string }> {
+    if (!input?.projectId) throw new Error("projectId is required");
+    if (!input?.name) throw new Error("name is required");
+    return this.request("/online-eval-samplers", "POST", input);
+  }
+
+  /**
+   * Update fields of an online-eval sampler (enable/disable, rate, scorers, …).
+   * Owner/admin only. PATCH /online-eval-samplers/:id
+   */
+  async updateOnlineEvalSampler(
+    id: string,
+    input: UpdateOnlineEvalSamplerInput,
+  ): Promise<{ ok: boolean; id: string; fields: string[] }> {
+    if (!id) throw new Error("id is required");
+    if (!input || Object.keys(input).length === 0) {
+      throw new Error("at least one field to update is required");
+    }
+    return this.request(`/online-eval-samplers/${encodeURIComponent(id)}`, "PATCH", input);
+  }
+
+  /**
+   * Delete an online-eval sampler. Owner/admin only.
+   * DELETE /online-eval-samplers/:id
+   */
+  async deleteOnlineEvalSampler(id: string): Promise<{ ok: boolean; id: string }> {
+    if (!id) throw new Error("id is required");
+    return this.request(`/online-eval-samplers/${encodeURIComponent(id)}`, "DELETE");
+  }
+
+  // ── Prompt optimizer ───────────────────────────────────────────────
+
+  /**
+   * Automatically optimize a prompt against eval cases + scorers using the
+   * chosen strategy (meta-prompt, few-shot, genetic, bootstrap). Returns the
+   * best prompt found plus before/after scores, changelog, and cost. Editor+.
+   * The call is bounded by costCeilingUsd (server rejects with 402 if exceeded).
+   * POST /prompts/optimize
+   */
+  async optimizePrompt(input: OptimizePromptInput): Promise<OptimizePromptResult> {
+    if (!input?.projectId) throw new Error("projectId is required");
+    if (!input?.prompt || input.prompt.trim().length === 0) throw new Error("prompt is required");
+    if (!input?.strategy) throw new Error("strategy is required");
+    if (!input?.evalCases || input.evalCases.length === 0) throw new Error("at least one evalCase is required");
+    if (!input?.scorers || input.scorers.length === 0) throw new Error("at least one scorer is required");
+    return this.request("/prompts/optimize", "POST", input);
   }
 
   // ── Internal helpers ───────────────────────────────────────────────
@@ -4586,66 +6471,112 @@ export class EvalGuard {
     const isWrite = method === "POST" || method === "PUT" || method === "PATCH";
     const idempotencyKey = isWrite ? newIdempotencyKey() : undefined;
 
+    // Whether a FAILED attempt may be replayed. See IDEMPOTENT_WRITE_ROUTES:
+    // most write routes do not honour the Idempotency-Key we send, so retrying
+    // them after a 502/network drop mints duplicate resources.
+    const retriable = isRetriableRequest(method, path);
+
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30_000);
       try {
-        const res = await fetch(`${this.baseUrl}${path}`, {
-          method,
-          headers: {
-            Authorization: `Bearer ${this.apiKey}`,
-            "Content-Type": "application/json",
-            "x-evalguard-client-version": SDK_VERSION,
-            ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
-            ...this.subjectHeaders(),
-            ...(extraHeaders ?? {}),
+        const res = await followSameHostRedirects(
+          `${this.baseUrl}${path}`,
+          {
+            method,
+            headers: {
+              Authorization: `Bearer ${this.apiKey}`,
+              "Content-Type": "application/json",
+              "x-evalguard-client-version": SDK_VERSION,
+              ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+              ...this.subjectHeaders(),
+              ...(extraHeaders ?? {}),
+            },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
           },
-          body: body ? JSON.stringify(body) : undefined,
-          signal: controller.signal,
-        });
+          // A REDIRECT TO ANOTHER HOST IS NOT AN ANSWER (2026-08-10, revised
+          // 2026-08-12). WHATWG/undici default to `redirect: "follow"` (20
+          // hops), and on 301/302/303 the platform rewrites the request to a GET
+          // and DROPS the body — so `checkFirewall(text)` became a bodyless GET
+          // at whatever host the response named, and that host's
+          // `{"blocked":false}` was returned as a verdict on text it never
+          // received.
+          //
+          // SEC-051 first shipped `redirect: "error"` here. That also refuses
+          // the redirects PRODUCTION ITSELF emits on this route — a
+          // trailing-slash 308 and an http->https 301 — so a customer whose
+          // EVALGUARD_BASE_URL carries either shape got a hard-failing SDK on a
+          // patch upgrade. `followSameHostRedirects` follows a hop only while
+          // the HOST is unchanged and never downgrades https->http; anything
+          // else throws and lands on the catch below, failing CLOSED exactly as
+          // `"error"` did.
+          //
+          // Never bare `"manual"`: an un-followed 3xx is a normal Response whose
+          // status a later `res.ok` branch can misread. The hop loop is the
+          // whole control.
+          { label: `${method} ${path}` },
+        );
 
         if (res.status === 429) {
-          const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
-          const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * Math.pow(2, attempt), 60000);
+          // Bounded + jittered: a hostile or mis-set Retry-After can no longer
+          // park the caller's request handler for hours. See computeRetryDelayMs.
+          const delay = computeRetryDelayMs(res.headers.get('retry-after'), attempt);
           if (attempt < maxRetries) {
             await new Promise(r => setTimeout(r, delay));
             continue;
           }
         }
 
-        if (res.status >= 500 && attempt < maxRetries) {
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        // 5xx: replay only when replaying is SAFE. A 502 can mean the write
+        // committed and the response was lost, so a non-idempotent POST must
+        // surface the error rather than mint a second resource.
+        if (res.status >= 500 && retriable && attempt < maxRetries) {
+          // Jittered so N clients recovering from the same 5xx do not
+          // re-stampede the origin in lockstep.
+          await new Promise(r => setTimeout(r, computeRetryDelayMs(null, attempt)));
           continue;
         }
 
         if (res.status >= 400 && res.status !== 429 && res.status < 500) {
-          const errBody = await res.json().catch(() => null) as
-            | { error?: { code?: string; message?: string; requestId?: string }; message?: string }
-            | null;
+          const errBody = (await res.json().catch(() => null)) as ErrorEnvelope | null;
           const apiErr = errBody?.error;
           throw new EvalGuardError(
             `EvalGuard API error ${res.status}: ${apiErr?.message ?? errBody?.message ?? (errBody === null ? (res.statusText || "Unknown error") : "Unknown error")}`,
-            { code: apiErr?.code ?? `HTTP_${res.status}`, status: res.status, requestId: apiErr?.requestId },
+            {
+              code: apiErr?.code ?? `HTTP_${res.status}`,
+              status: res.status,
+              // Prefer the envelope's requestId; fall back to the X-Request-Id
+              // header so 400/422/500 (whose bodies omit it) still correlate.
+              requestId: extractRequestId(res, errBody),
+            },
           );
         }
 
         if (!res.ok) {
-          const errBody = await res.json().catch(() => null) as
-            | { error?: { code?: string; message?: string; requestId?: string }; message?: string }
-            | null;
+          const errBody = (await res.json().catch(() => null)) as ErrorEnvelope | null;
           const apiErr = errBody?.error;
           throw new EvalGuardError(
             `EvalGuard API error ${res.status}: ${apiErr?.message ?? errBody?.message ?? (errBody === null ? (res.statusText || "Unknown error") : "Unknown error")}`,
-            { code: apiErr?.code ?? `HTTP_${res.status}`, status: res.status, requestId: apiErr?.requestId },
+            {
+              code: apiErr?.code ?? `HTTP_${res.status}`,
+              status: res.status,
+              requestId: extractRequestId(res, errBody),
+            },
           );
         }
 
         // Unwrap the standard { success, data } API envelope so typed methods
         // resolve to T (the payload), not the envelope (audit TS-SDK-ENVELOPE).
+        //
+        // OWN-property membership (audit js-requireverdict-own-properties): the
+        // old `"data" in json` followed the prototype chain, so
+        // `Object.prototype.data = { decision: "allow" }` made THIS LINE return
+        // a fabricated payload on an empty 200 — and its fields are genuine own
+        // properties, so hardening requireVerdict alone would not have caught
+        // it. See unwrapApiEnvelope.
         const json = (await res.json()) as unknown;
-        return (json && typeof json === "object" && "success" in json && "data" in json
-          ? (json as { data: T }).data
-          : (json as T));
+        return unwrapApiEnvelope(json) as T;
       } catch (err) {
         lastError = err as Error;
         // HTTP errors are already typed + non-retryable; let them through
@@ -4653,14 +6584,18 @@ export class EvalGuard {
         if (err instanceof EvalGuardError) {
           throw err;
         }
-        if (attempt < maxRetries) {
+        // Same rule as the 5xx branch above: a dropped connection or a
+        // client-side timeout does NOT prove the server never applied the
+        // write, so only replay requests that are safe to replay.
+        if (retriable && attempt < maxRetries) {
           await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
           continue;
         }
-        // Retries exhausted on a network/transport failure (the raw
-        // `TypeError: fetch failed` for no-server/DNS/connection-refused, or an
-        // AbortError on timeout). Surface it as a typed, catchable error instead
-        // of letting the raw TypeError escape (audit: sdk-untyped-network-error).
+        // Retries exhausted (or the request was not safe to replay) on a
+        // network/transport failure (the raw `TypeError: fetch failed` for
+        // no-server/DNS/connection-refused, or an AbortError on timeout).
+        // Surface it as a typed, catchable error instead of letting the raw
+        // TypeError escape (audit: sdk-untyped-network-error).
         throw new EvalGuardError(
           `Request to ${path} failed: ${err instanceof Error ? err.message : String(err)}`,
           { code: "NETWORK_ERROR", cause: err },
@@ -4682,32 +6617,46 @@ export class EvalGuard {
   private async requestText(path: string, method: string): Promise<string> {
     const maxRetries = 3;
     let lastError: Error | null = null;
+    // Same replay-safety rule as request(). Every current caller is a GET
+    // export, so this is a guard against a future non-idempotent caller.
+    const retriable = isRetriableRequest(method, path);
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 30_000);
       try {
-        const res = await fetch(`${this.baseUrl}${path}`, {
-          method,
-          headers: {
-            Authorization: `Bearer ${this.apiKey}`,
-            "x-evalguard-client-version": SDK_VERSION,
-            ...this.subjectHeaders(),
+        const res = await followSameHostRedirects(
+          `${this.baseUrl}${path}`,
+          {
+            method,
+            headers: {
+              Authorization: `Bearer ${this.apiKey}`,
+              "x-evalguard-client-version": SDK_VERSION,
+              ...this.subjectHeaders(),
+            },
+            signal: controller.signal,
           },
-          signal: controller.signal,
-        });
+          // See request(). Same rule on the text/NDJSON/CSV export path: an
+          // export substituted wholesale by whoever can answer with a
+          // cross-host `Location` is not this org's data, while a same-host
+          // normalising hop is the origin doing its job.
+          { label: `${method} ${path}` },
+        );
 
         if (res.status === 429) {
-          const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
-          const delay = retryAfter > 0 ? retryAfter * 1000 : Math.min(1000 * Math.pow(2, attempt), 60000);
+          // Bounded + jittered: a hostile or mis-set Retry-After can no longer
+          // park the caller's request handler for hours. See computeRetryDelayMs.
+          const delay = computeRetryDelayMs(res.headers.get('retry-after'), attempt);
           if (attempt < maxRetries) {
             await new Promise(r => setTimeout(r, delay));
             continue;
           }
         }
 
-        if (res.status >= 500 && attempt < maxRetries) {
-          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        if (res.status >= 500 && retriable && attempt < maxRetries) {
+          // Jittered so N clients recovering from the same 5xx do not
+          // re-stampede the origin in lockstep.
+          await new Promise(r => setTimeout(r, computeRetryDelayMs(null, attempt)));
           continue;
         }
 
@@ -4719,21 +6668,26 @@ export class EvalGuard {
           // code + requestId — same as request() — instead of always falling back
           // to HTTP_<status> (audit TS-SDK-ENVELOPE: requestText error path).
           const rawText = await res.text().catch(() => res.statusText);
+          let parsedBody: ErrorEnvelope | null = null;
           let apiErr: { code?: string; message?: string; requestId?: string } | undefined;
           let envelopeMessage: string | undefined;
           try {
-            const parsed = JSON.parse(rawText) as
-              | { error?: { code?: string; message?: string; requestId?: string }; message?: string }
-              | null;
-            apiErr = parsed?.error;
-            envelopeMessage = apiErr?.message ?? parsed?.message;
+            parsedBody = JSON.parse(rawText) as ErrorEnvelope | null;
+            apiErr = parsedBody?.error;
+            envelopeMessage = apiErr?.message ?? parsedBody?.message;
           } catch {
             // Non-JSON error body (e.g. a plain-text upstream/proxy error) → keep
             // the raw text in the message and fall back to HTTP_<status>.
           }
           throw new EvalGuardError(
             `EvalGuard API error ${res.status}: ${envelopeMessage ?? rawText}`,
-            { code: apiErr?.code ?? `HTTP_${res.status}`, status: res.status, requestId: apiErr?.requestId },
+            {
+              code: apiErr?.code ?? `HTTP_${res.status}`,
+              status: res.status,
+              // Envelope requestId first, then the X-Request-Id header — so even
+              // a non-JSON error body still yields the correlation id.
+              requestId: extractRequestId(res, parsedBody),
+            },
           );
         }
 
@@ -4743,7 +6697,7 @@ export class EvalGuard {
         if (err instanceof EvalGuardError) {
           throw err;
         }
-        if (attempt < maxRetries) {
+        if (retriable && attempt < maxRetries) {
           await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
           continue;
         }

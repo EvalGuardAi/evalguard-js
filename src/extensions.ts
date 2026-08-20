@@ -1,11 +1,12 @@
 /**
  * Programmatic plugin / strategy / scorer registration.
  *
- * Promptfoo lets users define a custom red-team plugin or eval scorer in
- * their own TypeScript code and pass it directly to `evaluate()` /
- * `redteam.run()`. Until now, EvalGuard customers had to fork the
- * monorepo to extend the 249 built-in attack plugins, 106 scorers, or 43
- * strategies. This module closes that gap with a minimal extension API:
+ * This module lets EvalGuard customers define a custom red-team plugin, eval
+ * scorer, or attack strategy in their own TypeScript code and register it at
+ * runtime — extending the built-in attack plugins, scorers, and strategies
+ * without forking the monorepo. (Count-free on purpose: this JSDoc ships to
+ * npm and /docs/sdk/reference, where stale numbers rot — the live counts
+ * live in @evalguard/core/counts.) A minimal extension API:
  *
  *   import { EvalGuard, definePlugin, defineScorer, defineStrategy } from "@evalguard/sdk";
  *
@@ -32,8 +33,6 @@
  * locally. Findings are reported back to the EvalGuard backend via the
  * existing security-scan endpoint so they appear in the dashboard
  * alongside server-side scan results.
- *
- * This mirrors Promptfoo's redteam.Plugins / Strategies / Graders surface.
  */
 
 import type { Severity, SecurityFinding } from "./client";

@@ -1,10 +1,9 @@
-// ── Imperative EvaluationLogger (Weave-style) ──────────────────────────
+// ── Imperative EvaluationLogger ────────────────────────────────────────
 //
 // The declarative `client.eval(EvalParams)` API posts a full eval config and
 // lets the SERVER run the model. That doesn't fit pipelines that already have
 // their own model calls and just want to RECORD predictions + scores against a
-// run as they go (the way Weave's `EvaluationLogger` / Braintrust's
-// experiment-logging works).
+// run as they go, incrementally, rather than handing the server a full config.
 //
 // `client.startEvalLogger()` creates an `eval_runs` row in EXTERNAL mode
 // (status=running, the server does NOT execute the model) and returns an
@@ -112,7 +111,7 @@ interface BufferedRow {
 }
 
 /**
- * Imperative, Weave-style logger bound to one eval run. Construct it via
+ * Imperative logger bound to one eval run. Construct it via
  * {@link EvalGuard.startEvalLogger}, not directly.
  *
  *   const logger = await client.startEvalLogger({ projectId, name: "smoke", model: "gpt-4o" });
@@ -192,7 +191,7 @@ export class EvaluationLogger {
     this.buffer.set(index, buffered);
 
     if (this.buffer.size >= this.flushAt) {
-      // Fire-and-forget: keep logPrediction synchronous (Weave parity). Errors
+      // Fire-and-forget: keep logPrediction synchronous (non-blocking). Errors
       // surface on the next awaited flush()/finish() via re-buffering below.
       void this.flush().catch(() => {
         /* swallowed here; a real failure re-throws on the next awaited flush */
@@ -265,6 +264,21 @@ export class EvaluationLogger {
     const rows = Array.from(this.buffer.values());
     this.buffer.clear();
 
+    // Record every snapshotted row's full state BEFORE any await (audit HIGH
+    // 2026-07-26). These rows have ALREADY left the buffer, so a logScore()
+    // that lands while the request is in flight found neither `buffer` nor
+    // `flushed` and re-buffered the BLANK defensive carrier (input:"",
+    // output:"") — the next flush then upserted that over the real row and
+    // WIPED its input/output. The documented pattern hits this every flushAt-th
+    // case, because logPrediction()'s auto-flush is fire-and-forget and the
+    // very next statement is logScore(index, …). The invariant is simply:
+    // a row that is not in `buffer` must be findable in `flushed`.
+    // A chunk that fails is restored into `buffer` below, which takes
+    // precedence in logScore(), so pre-recording can never mask a failure.
+    for (const r of rows) {
+      this.flushed.set(r.test_case_index, { ...r, scores: { ...r.scores } });
+    }
+
     // Respect the server's per-request row cap by chunking. Re-buffer any chunk
     // that fails so the rows aren't silently dropped and a later flush retries.
     for (let i = 0; i < rows.length; i += SERVER_MAX_ROWS) {
@@ -273,12 +287,6 @@ export class EvaluationLogger {
         await this.request(`/evals/${encodeURIComponent(this.runId)}/results`, "POST", {
           results: chunk,
         });
-        // Record each successfully-flushed row's full state so a later
-        // logScore() for an already-flushed index re-buffers the COMPLETE row
-        // (real input/output) and the late score merges, not a blank carrier.
-        for (const r of chunk) {
-          this.flushed.set(r.test_case_index, { ...r, scores: { ...r.scores } });
-        }
       } catch (err) {
         // Restore the failed chunk (and any not-yet-sent rows) into the buffer
         // so the caller can retry; merge instead of overwrite to preserve any

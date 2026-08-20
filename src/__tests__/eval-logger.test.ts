@@ -3,7 +3,7 @@ import { EvalGuard } from "../client";
 import { EvaluationLogger } from "../eval-logger";
 
 // ---------------------------------------------------------------------------
-// Imperative EvaluationLogger (Weave-style).
+// Imperative EvaluationLogger.
 //   - startEvalLogger() POSTs /evals with external:true and binds to runId.
 //   - logPrediction buffers + auto-assigns test_case_index.
 //   - logScore merges a scorer result into the buffered row's scores map.
@@ -209,6 +209,59 @@ describe("EvaluationLogger.logPrediction / logScore (buffering)", () => {
     // The late scorer set passed=false → row aggregate reflects it.
     expect(rows[0].passed).toBe(false);
     expect(rows[0].score).toBe(0.4);
+  });
+
+  // Audit HIGH 2026-07-26: `flushed` was populated only AFTER `await
+  // this.request(...)`, so a logScore() landing while the auto-flush was
+  // IN FLIGHT found the row in neither `buffer` nor `flushed` and re-buffered
+  // the blank defensive carrier — the next upsert then wiped the row's real
+  // input/output. The documented pattern (logPrediction then logScore on the
+  // returned index) hits this on every flushAt-th case, because the auto-flush
+  // is fire-and-forget.
+  it("logScore DURING an in-flight auto-flush keeps the real input/output", async () => {
+    const { logger, f } = await newLogger(2);
+    logger.logPrediction({ input: "q1", output: "a1" });
+    // This one trips the auto-flush (fire-and-forget, NOT awaited).
+    const { index } = logger.logPrediction({ input: "the-question", output: "the-answer" });
+    // …and the very next statement scores it — exactly as the JSDoc example does.
+    logger.logScore(index, "exact-match", 1, true);
+
+    await Promise.resolve();
+    await Promise.resolve();
+    await logger.flush();
+
+    // call 0 = create, call 1 = auto-flush, call 2 = the late-score re-flush.
+    const rows = bodyOf(f, 2).results as Array<Record<string, unknown>>;
+    const row = rows.find((r) => r.test_case_index === index)!;
+    expect(row).toBeDefined();
+    expect(row.input).toBe("the-question");
+    expect(row.output).toBe("the-answer");
+    expect(row.scores).toMatchObject({ "exact-match": { score: 1, passed: true } });
+  });
+
+  it("a FAILED flush still lets logScore see the full row (buffer restore wins)", async () => {
+    const f = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true, status: 200, statusText: "OK",
+        json: vi.fn().mockResolvedValue({ success: true, data: { id: "run-1", status: "running" } }),
+      })
+      // 4xx is not retried by the client, so the flush rejects immediately.
+      .mockResolvedValue({
+        ok: false, status: 400, statusText: "Bad Request",
+        text: vi.fn().mockResolvedValue("boom"),
+        json: vi.fn().mockResolvedValue({ success: false, error: { message: "boom" } }),
+      });
+    globalThis.fetch = f;
+    const c = new EvalGuard({ apiKey: "eg_k" });
+    const logger = await c.startEvalLogger({ projectId: "p", name: "n", model: "m", flushAt: 50 });
+
+    const { index } = logger.logPrediction({ input: "keep-me", output: "and-me" });
+    await expect(logger.flush()).rejects.toThrow();
+    // Row was restored to the buffer, so it is still complete + pending.
+    expect(logger.pending).toBe(1);
+    logger.logScore(index, "s", 1, true);
+    expect(logger.pending).toBe(1);
   });
 });
 
